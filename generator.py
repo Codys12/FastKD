@@ -82,6 +82,18 @@ class Streamer:
             for mb in batches
         ]
 
+        # Precompute rotary position embeddings if the model provides a
+        # rotary embedding helper. This is required for models like Qwen3
+        # which expect a tuple of cosine/sine tensors instead of raw IDs.
+        rotary_embeds = None
+        if hasattr(self.layers[0].self_attn, "rotary_emb"):
+            try:
+                rotary_embeds = [
+                    self.layers[0].self_attn.rotary_emb(pos) for pos in position_ids
+                ]
+            except Exception:
+                rotary_embeds = None
+
         self.embed.to(device)
         hidden = [self.embed(mb) for mb in batches]
         self.embed.to("cpu")
@@ -90,7 +102,22 @@ class Streamer:
         for layer in self.layers:
             layer.to(device)
             next_hidden = []
-            for h, pos in zip(hidden, position_ids):
+            # Use rotary embeddings if available for this layer
+            layer_rotary = rotary_embeds
+            if hasattr(layer.self_attn, "rotary_emb") and rotary_embeds is not None:
+                try:
+                    layer_rotary = [
+                        layer.self_attn.rotary_emb(pos) for pos in position_ids
+                    ]
+                except Exception:
+                    layer_rotary = rotary_embeds
+
+            for i, h in enumerate(hidden):
+                pos = (
+                    layer_rotary[i]
+                    if layer_rotary is not None
+                    else position_ids[i]
+                )
                 out = layer(h, position_ids=pos)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
