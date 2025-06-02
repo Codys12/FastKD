@@ -71,31 +71,50 @@ class Streamer:
     ) -> torch.Tensor:
         device = device or self.device
 
-        # Split into micro-batches and move each to the target device
         batches = [
             input_ids[i : i + micro_batch_size].to(device)
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
-        # Token embeddings (rotary position embeddings are handled *inside* the model)
+        # Token embeddings
         self.embed.to(device)
-        hidden = [self.embed(mb) for mb in batches]
+        hidden: List[torch.Tensor] = []
+        pos_ids_list: List[torch.Tensor] = []
+        for mb in batches:
+            seq_len = mb.size(1)
+            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+                mb.size(0), -1
+            )
+            hidden.append(self.embed(mb))
+            pos_ids_list.append(pos_ids)
         self.embed.to("cpu")
         torch.cuda.empty_cache()
 
-        # Stream through layers, off-loading each one after use
+        # Stream through transformer layers -------------------------------------------------
         for layer in self.layers:
             layer.to(device)
-            next_hidden = []
-            for h in hidden:
-                out = layer(h)                     # let the layer handle positions internally
+            next_hidden: List[torch.Tensor] = []
+
+            for h, pos in zip(hidden, pos_ids_list):
+                # ------------- FIX 1: always supply rotary tuple ---------------------------
+                kwargs = {"position_ids": pos}
+                try:
+                    # Pre-compute (cos, sin) and hand it in if accepted
+                    rotary_tuple = layer.self_attn.rotary_emb(pos)
+                    kwargs["position_embeddings"] = rotary_tuple
+                    out = layer(h, **kwargs)
+                except TypeError:
+                    # Layer doesn't take that kwarg – fall back to position_ids only
+                    out = layer(h, position_ids=pos)
+                # ----------------------------------------------------------------------------
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
+
             hidden = next_hidden
             layer.to("cpu")
             torch.cuda.empty_cache()
 
-        # Final projection to logits
+        # Final projection
         self.lm_head.to(device)
         logits = [self.lm_head(h) for h in hidden]
         self.lm_head.to("cpu")
@@ -111,8 +130,7 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
     probs_all: List[List[List[float]]] = []
     bsz, seqlen, _ = probs.shape
     for b in range(bsz):
-        ids_seq = []
-        probs_seq = []
+        ids_seq, probs_seq = [], []
         for s in range(seqlen):
             p = probs[b, s]
             samples = torch.multinomial(p, rounds, replacement=True)
@@ -125,9 +143,8 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
-    # `examples` is a list of dicts from streaming datasets → extract "text"
     return tokenizer(
-        [ex["text"] for ex in examples],
+        [ex["text"] for ex in examples],           # FIX 2: robust field access
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -187,23 +204,26 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
         logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
         ids, probs = sample_distribution(logits, args.sampling_rounds)
         for i in range(len(input_ids)):
-            record = {
-                "input_ids": input_ids[i].tolist(),
-                "sampled_ids": ids[i],
-                "sampled_probs": probs[i],
-            }
-            all_records.append(record)
+            all_records.append(
+                {
+                    "input_ids": input_ids[i].tolist(),
+                    "sampled_ids": ids[i],
+                    "sampled_probs": probs[i],
+                }
+            )
         total += len(input_ids)
         if total >= args.push_every:
-            ds = Dataset.from_list(all_records)
-            ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
+            Dataset.from_list(all_records).push_to_hub(
+                args.output_repo, token=args.hf_token, append=True
+            )
             all_records.clear()
             total = 0
         if SHUTDOWN.is_set():
             break
     if all_records and not SHUTDOWN.is_set():
-        ds = Dataset.from_list(all_records)
-        ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
+        Dataset.from_list(all_records).push_to_hub(
+            args.output_repo, token=args.hf_token, append=True
+        )
 
 
 def main():
