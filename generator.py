@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import torch.multiprocessing as mp
 from dataclasses import dataclass
 from typing import List
@@ -12,6 +13,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 STREAMER: "Streamer" | None = None
+SHUTDOWN: mp.Event | None = None
 
 
 @dataclass
@@ -127,20 +129,32 @@ def collate_fn(examples, tokenizer, max_seq_len: int):
     )
 
 
-def streaming_dataloader(ds, tokenizer, batch_size: int, max_seq_len: int):
+def streaming_dataloader(
+    ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: mp.Event | None = None
+):
     batch = []
     for example in ds:
+        if shutdown and shutdown.is_set():
+            break
         batch.append(example)
         if len(batch) == batch_size:
             yield collate_fn(batch, tokenizer, max_seq_len)
             batch.clear()
-    if batch:
+            if shutdown and shutdown.is_set():
+                break
+    if batch and not (shutdown and shutdown.is_set()):
         yield collate_fn(batch, tokenizer, max_seq_len)
 
 
-def worker_main(rank: int, args: Args, streamer: Streamer):
-    global STREAMER
+def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
+    global STREAMER, SHUTDOWN
     STREAMER = streamer
+    SHUTDOWN = shutdown
+
+    def _handle_sigterm(signum, frame):
+        shutdown.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     device = (
         torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     )
@@ -154,11 +168,15 @@ def worker_main(rank: int, args: Args, streamer: Streamer):
     )
     dataset = dataset.shard(num_shards=args.num_workers, index=rank)
 
-    dataloader = streaming_dataloader(dataset, tokenizer, args.batch_size, args.max_seq_len)
+    dataloader = streaming_dataloader(
+        dataset, tokenizer, args.batch_size, args.max_seq_len, shutdown
+    )
 
     all_records: List[dict] = []
     total = 0
     for batch in dataloader:
+        if SHUTDOWN.is_set():
+            break
         input_ids = batch["input_ids"]
         logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
         ids, probs = sample_distribution(logits, args.sampling_rounds)
@@ -175,7 +193,9 @@ def worker_main(rank: int, args: Args, streamer: Streamer):
             ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
             all_records.clear()
             total = 0
-    if all_records:
+        if SHUTDOWN.is_set():
+            break
+    if all_records and not SHUTDOWN.is_set():
         ds = Dataset.from_list(all_records)
         ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
 
@@ -184,20 +204,30 @@ def main():
     args = parse_args()
 
     mp_context = mp.get_context("spawn")
-    global STREAMER
+    shutdown_event = mp_context.Event()
+
+    def _handle_sigterm(signum, frame):
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    global STREAMER, SHUTDOWN
+    SHUTDOWN = shutdown_event
     STREAMER = Streamer(args.model_name)
     STREAMER.model.share_memory()
 
     if args.num_workers > 1:
         processes = []
         for rank in range(args.num_workers):
-            p = mp_context.Process(target=worker_main, args=(rank, args, STREAMER))
+            p = mp_context.Process(
+                target=worker_main, args=(rank, args, STREAMER, shutdown_event)
+            )
             p.start()
             processes.append(p)
         for p in processes:
             p.join()
     else:
-        worker_main(0, args, STREAMER)
+        worker_main(0, args, STREAMER, shutdown_event)
 
 
 if __name__ == "__main__":
