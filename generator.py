@@ -61,6 +61,7 @@ class Streamer:
         )
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
+        self.rotary_emb = self.model.model.rotary_emb            # FIX 1: keep a handle to rotary emb
         self.lm_head = self.model.lm_head
 
     def forward(
@@ -70,13 +71,11 @@ class Streamer:
         device: torch.device | None = None,
     ) -> torch.Tensor:
         device = device or self.device
-
         batches = [
             input_ids[i : i + micro_batch_size].to(device)
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
-        # Token embeddings
         self.embed.to(device)
         hidden: List[torch.Tensor] = []
         pos_ids_list: List[torch.Tensor] = []
@@ -90,31 +89,23 @@ class Streamer:
         self.embed.to("cpu")
         torch.cuda.empty_cache()
 
-        # Stream through transformer layers -------------------------------------------------
         for layer in self.layers:
             layer.to(device)
             next_hidden: List[torch.Tensor] = []
-
             for h, pos in zip(hidden, pos_ids_list):
-                # ------------- FIX 1: always supply rotary tuple ---------------------------
-                kwargs = {"position_ids": pos}
-                try:
-                    # Pre-compute (cos, sin) and hand it in if accepted
-                    rotary_tuple = layer.self_attn.rotary_emb(pos)
-                    kwargs["position_embeddings"] = rotary_tuple
-                    out = layer(h, **kwargs)
-                except TypeError:
-                    # Layer doesn't take that kwarg – fall back to position_ids only
-                    out = layer(h, position_ids=pos)
-                # ----------------------------------------------------------------------------
+                # FIX 2: compute (cos, sin) tuple the same way Qwen3Model does
+                cos_sin = self.rotary_emb(h, pos)
+                out = layer(
+                    h,
+                    position_ids=pos,
+                    position_embeddings=cos_sin,
+                )
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
-
             hidden = next_hidden
             layer.to("cpu")
             torch.cuda.empty_cache()
 
-        # Final projection
         self.lm_head.to(device)
         logits = [self.lm_head(h) for h in hidden]
         self.lm_head.to("cpu")
@@ -144,7 +135,7 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
     return tokenizer(
-        [ex["text"] for ex in examples],           # FIX 2: robust field access
+        [ex["text"] for ex in examples],  # robust list-of-dicts handling
         return_tensors="pt",
         padding=True,
         truncation=True,
