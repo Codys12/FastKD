@@ -70,39 +70,32 @@ class Streamer:
         device: torch.device | None = None,
     ) -> torch.Tensor:
         device = device or self.device
+
+        # Split into micro-batches and move each to the target device
         batches = [
             input_ids[i : i + micro_batch_size].to(device)
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
+        # Token embeddings (rotary position embeddings are handled *inside* the model)
         self.embed.to(device)
-        hidden = []
-        position_ids_list = []
-        for mb in batches:
-            seq_len = mb.size(1)
-            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
-                mb.size(0), -1
-            )
-            hidden.append(self.embed(mb))
-            position_ids_list.append(pos_ids)
+        hidden = [self.embed(mb) for mb in batches]
         self.embed.to("cpu")
         torch.cuda.empty_cache()
 
+        # Stream through layers, off-loading each one after use
         for layer in self.layers:
             layer.to(device)
             next_hidden = []
-            for h, pos in zip(hidden, position_ids_list):
-                # Pass position_ids so rotary/absolute embeddings are applied
-                try:
-                    out = layer(h, position_ids=pos)
-                except TypeError:
-                    out = layer(h)
+            for h in hidden:
+                out = layer(h)                     # let the layer handle positions internally
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
             hidden = next_hidden
             layer.to("cpu")
             torch.cuda.empty_cache()
 
+        # Final projection to logits
         self.lm_head.to(device)
         logits = [self.lm_head(h) for h in hidden]
         self.lm_head.to("cpu")
@@ -132,8 +125,9 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
+    # `examples` is a list of dicts from streaming datasets → extract "text"
     return tokenizer(
-        [ex["text"] for ex in examples],  # fixed to handle list of dicts
+        [ex["text"] for ex in examples],
         return_tensors="pt",
         padding=True,
         truncation=True,
