@@ -75,6 +75,13 @@ class Streamer:
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
+        position_ids = [
+            torch.arange(mb.size(1), device=device)
+            .unsqueeze(0)
+            .expand(mb.size(0), -1)
+            for mb in batches
+        ]
+
         self.embed.to(device)
         hidden = [self.embed(mb) for mb in batches]
         self.embed.to("cpu")
@@ -83,8 +90,8 @@ class Streamer:
         for layer in self.layers:
             layer.to(device)
             next_hidden = []
-            for h in hidden:
-                out = layer(h)
+            for h, pos in zip(hidden, position_ids):
+                out = layer(h, position_ids=pos)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
             hidden = next_hidden
