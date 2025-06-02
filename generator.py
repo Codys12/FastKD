@@ -126,17 +126,30 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    dataset = load_dataset(args.dataset_name, split=args.dataset_split, token=args.hf_token)
-
-    sampler = None
-    if torch.distributed.is_initialized():
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        collate_fn=lambda x: collate_fn(x, tokenizer, args.max_seq_len),
+    dataset = load_dataset(
+        args.dataset_name,
+        split=args.dataset_split,
+        token=args.hf_token,
+        streaming=True,
     )
+
+    if torch.distributed.is_initialized():
+        dataset = dataset.shard(
+            num_shards=torch.distributed.get_world_size(),
+            index=local_rank,
+        )
+
+    def streaming_dataloader(ds):
+        batch = []
+        for example in ds:
+            batch.append(example)
+            if len(batch) == args.batch_size:
+                yield collate_fn(batch, tokenizer, args.max_seq_len)
+                batch.clear()
+        if batch:
+            yield collate_fn(batch, tokenizer, args.max_seq_len)
+
+    dataloader = streaming_dataloader(dataset)
     streamer = Streamer(args.model_name, device)
 
     all_records: List[dict] = []
