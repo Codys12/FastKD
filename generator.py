@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import inspect
 import torch.multiprocessing as mp
 from dataclasses import dataclass
 from typing import List
@@ -112,13 +113,25 @@ class Streamer:
                 except Exception:
                     layer_rotary = rotary_embeds
 
+            # Determine expected positional argument name
+            param_name = "position_ids"
+            try:
+                sig = inspect.signature(layer.forward)
+                if "position_embeddings" in sig.parameters:
+                    param_name = "position_embeddings"
+            except Exception:
+                pass
+
             for i, h in enumerate(hidden):
                 pos = (
                     layer_rotary[i]
                     if layer_rotary is not None
                     else position_ids[i]
                 )
-                out = layer(h, position_ids=pos)
+                if param_name == "position_embeddings":
+                    out = layer(h, position_embeddings=pos)
+                else:
+                    out = layer(h, position_ids=pos)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
             hidden = next_hidden
