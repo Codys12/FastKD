@@ -25,6 +25,7 @@ class Args:
     micro_batch_size: int
     sampling_rounds: int
     push_every: int
+    max_seq_len: int
     hf_token: str | None = None
 
 
@@ -43,6 +44,7 @@ def parse_args() -> Args:
         help="Number of sampling rounds per token as in the paper",
     )
     parser.add_argument("--push_every", type=int, default=1000)
+    parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--hf_token", default=None)
     args = parser.parse_args()
     return Args(**vars(args))
@@ -108,8 +110,14 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
     return ids_all, probs_all
 
 
-def collate_fn(examples, tokenizer):
-    return tokenizer(examples["text"], return_tensors="pt", padding=True, truncation=True)
+def collate_fn(examples, tokenizer, max_seq_len: int):
+    return tokenizer(
+        examples["text"],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_seq_len,
+    )
 
 
 def main():
@@ -127,7 +135,7 @@ def main():
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
-        collate_fn=lambda x: collate_fn(x, tokenizer),
+        collate_fn=lambda x: collate_fn(x, tokenizer, args.max_seq_len),
     )
     streamer = Streamer(args.model_name, device)
 
