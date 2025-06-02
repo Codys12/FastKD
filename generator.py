@@ -133,7 +133,7 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
     return tokenizer(
-        examples["text"],
+        [ex["text"] for ex in examples],  # fixed to handle list of dicts
         return_tensors="pt",
         padding=True,
         truncation=True,
