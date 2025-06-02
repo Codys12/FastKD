@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import multiprocessing
+import torch.multiprocessing as mp
 from dataclasses import dataclass
 from typing import List
 
@@ -138,8 +138,9 @@ def streaming_dataloader(ds, tokenizer, batch_size: int, max_seq_len: int):
         yield collate_fn(batch, tokenizer, max_seq_len)
 
 
-def worker_main(rank: int, args: Args):
+def worker_main(rank: int, args: Args, streamer: Streamer):
     global STREAMER
+    STREAMER = streamer
     device = (
         torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     )
@@ -182,20 +183,21 @@ def worker_main(rank: int, args: Args):
 def main():
     args = parse_args()
 
-    mp = multiprocessing.get_context("fork")
+    mp_context = mp.get_context("spawn")
     global STREAMER
     STREAMER = Streamer(args.model_name)
+    STREAMER.model.share_memory()
 
     if args.num_workers > 1:
         processes = []
         for rank in range(args.num_workers):
-            p = mp.Process(target=worker_main, args=(rank, args))
+            p = mp_context.Process(target=worker_main, args=(rank, args, STREAMER))
             p.start()
             processes.append(p)
         for p in processes:
             p.join()
     else:
-        worker_main(0, args)
+        worker_main(0, args, STREAMER)
 
 
 if __name__ == "__main__":
