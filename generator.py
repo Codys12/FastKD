@@ -61,6 +61,7 @@ class Streamer:
         )
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
+        self.pos_embed = self.model.model.embed_positions  # add position embeddings
         self.lm_head = self.model.lm_head
 
     def forward(
@@ -76,8 +77,16 @@ class Streamer:
         ]
 
         self.embed.to(device)
-        hidden = [self.embed(mb) for mb in batches]
+        self.pos_embed.to(device)
+        hidden = []
+        for mb in batches:
+            seq_len = mb.size(1)
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+                mb.size(0), -1
+            )
+            hidden.append(self.embed(mb) + self.pos_embed(position_ids))
         self.embed.to("cpu")
+        self.pos_embed.to("cpu")
         torch.cuda.empty_cache()
 
         for layer in self.layers:
