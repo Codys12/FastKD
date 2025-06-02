@@ -120,8 +120,9 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
+    texts = [ex["text"] for ex in examples]
     return tokenizer(
-        examples["text"],
+        texts,
         return_tensors="pt",
         padding=True,
         truncation=True,
