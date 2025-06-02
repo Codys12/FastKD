@@ -61,7 +61,6 @@ class Streamer:
         )
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
-        self.pos_embed = self.model.model.embed_positions  # add position embeddings
         self.lm_head = self.model.lm_head
 
     def forward(
@@ -77,23 +76,27 @@ class Streamer:
         ]
 
         self.embed.to(device)
-        self.pos_embed.to(device)
         hidden = []
+        position_ids_list = []
         for mb in batches:
             seq_len = mb.size(1)
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
                 mb.size(0), -1
             )
-            hidden.append(self.embed(mb) + self.pos_embed(position_ids))
+            hidden.append(self.embed(mb))
+            position_ids_list.append(pos_ids)
         self.embed.to("cpu")
-        self.pos_embed.to("cpu")
         torch.cuda.empty_cache()
 
         for layer in self.layers:
             layer.to(device)
             next_hidden = []
-            for h in hidden:
-                out = layer(h)
+            for h, pos in zip(hidden, position_ids_list):
+                # Pass position_ids so rotary/absolute embeddings are applied
+                try:
+                    out = layer(h, position_ids=pos)
+                except TypeError:
+                    out = layer(h)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
             hidden = next_hidden
