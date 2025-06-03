@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+"""Knowledge‑Distillation (KD) data generator with streaming and Flash‑Attention.
+
+Key design points
+-----------------
+* **Flash‑Attention 2** is enabled by initialising the model on GPU, then moving
+  weights back to CPU so `share_memory()` (fork reuse) is cheap.
+* **Layer‑at‑a‑time streaming** keeps only one transformer block on GPU at once,
+  dramatically lowering the peak VRAM requirement.
+* **Inference‑only**: gradients are globally disabled and activations are freed
+  immediately after use.
+"""
+
 import argparse
-import os
 import signal
-import torch.multiprocessing as mp
 from dataclasses import dataclass
 from typing import List
 
 import torch
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.multiprocessing as mp
+from datasets import Dataset, load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-STREAMER: "Streamer" | None = None
-SHUTDOWN: mp.Event | None = None
+STREAMER: "Streamer" | None = None  # Will be filled by worker/parent
+SHUTDOWN: mp.Event | None = None    # Shared termination flag among workers
 
-
+# ---------------------------------------------------------------------------
+# CLI / args
+# ---------------------------------------------------------------------------
 @dataclass
 class Args:
     model_name: str
@@ -30,129 +43,120 @@ class Args:
     hf_token: str | None = None
 
 
-def parse_args() -> Args:
-    parser = argparse.ArgumentParser(description="Generate KD dataset with streaming")
-    parser.add_argument("--model_name", required=True)
-    parser.add_argument("--dataset_name", required=True)
-    parser.add_argument("--dataset_split", default="train")
-    parser.add_argument("--output_repo", required=True)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--micro_batch_size", type=int, default=1)
-    parser.add_argument(
-        "--sampling_rounds",
-        type=int,
-        default=50,
-        help="Number of sampling rounds per token as in the paper",
-    )
-    parser.add_argument("--push_every", type=int, default=1000)
-    parser.add_argument("--max_seq_len", type=int, default=2048)
-    parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--hf_token", default=None)
-    args = parser.parse_args()
-    return Args(**vars(args))
+def parse_args() -> Args:  # noqa: D401 — imperative mood OK
+    p = argparse.ArgumentParser(description="Generate KD dataset with streaming")
+    p.add_argument("--model_name", required=True)
+    p.add_argument("--dataset_name", required=True)
+    p.add_argument("--dataset_split", default="train")
+    p.add_argument("--output_repo", required=True)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--micro_batch_size", type=int, default=1)
+    p.add_argument("--sampling_rounds", type=int, default=50,
+                   help="Multinomial samples per token (KD)")
+    p.add_argument("--push_every", type=int, default=1000,
+                   help="#records to accumulate before pushing to hub")
+    p.add_argument("--max_seq_len", type=int, default=2048)
+    p.add_argument("--num_workers", type=int, default=1)
+    p.add_argument("--hf_token", default=None)
+    return Args(**vars(p.parse_args()))
 
-
+# ---------------------------------------------------------------------------
+# Streamer (layer‑streaming forward pass)
+# ---------------------------------------------------------------------------
 class Streamer:
-    """Streams forward‑passes with minimal VRAM via layer‑at‑a‑time transfers."""
+    """Streams the forward pass layer‑by‑layer to minimise GPU memory."""
 
     def __init__(self, model_name: str):
-        # Load once in the parent, then share() so workers fork‑reuse the weights.
-        # We *must* initialise on GPU to satisfy the Flash‑Attn safety check, then
-        # immediately move everything back to CPU so sharing works without OOMs.
-        self.model = self._load_model(model_name)
-        self.model.eval()
+        self.model = self._bootstrap_model(model_name)
+        self.model.eval()                      # inference‑only
+        self.device = torch.device("cpu")      # per‑worker override later
 
-        # These handles simplify later bookkeeping.
-        self.device = torch.device("cpu")  # set per‑worker later
-        self.layers = list(self.model.model.layers)
-        self.embed = self.model.model.embed_tokens
-        self.rotary_emb = self.model.model.rotary_emb
+        # Convenient handles
+        m = self.model.model  # type: ignore[attr-defined]
+        self.layers = list(m.layers)
+        self.embed = m.embed_tokens
+        self.rotary_emb = m.rotary_emb
         self.lm_head = self.model.lm_head
 
     # ------------------------------------------------------------------
-    # Model loading helpers
+    # Helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _load_model(model_name: str):
-        """Initialise the model on GPU (if present) to get Flash‑Attn, then
-        relocate weights to CPU for shared‑memory use.
+    def _bootstrap_model(model_name: str):
+        """Load the model with Flash‑Attention enabled.
+
+        Workflow:
+        1. If a CUDA device exists, load directly onto GPU with
+           `attn_implementation="flash_attention_2"`.
+        2. Immediately move *all* weights back to CPU so the parent process can
+           `share_memory()` them cheaply for forked workers.
+        3. If *no* GPU is present, fall back to plain attention on CPU.
         """
+        has_gpu = torch.cuda.is_available()
+        dev_map = {"": "cuda:0"} if has_gpu else {"": "cpu"}
 
-        gpu_avail = torch.cuda.is_available()
-        device_map_start = {"": "cuda:0"} if gpu_avail else {"": "cpu"}
-        common_kwargs = dict(torch_dtype=torch.float16, device_map=device_map_start, low_cpu_mem_usage=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map=dev_map,
+                attn_implementation="flash_attention_2" if has_gpu else None,
+                low_cpu_mem_usage=True,
+            )
+        except ValueError:
+            # Older Transformers that error on the explicit kwarg — load without.
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map=dev_map,
+                low_cpu_mem_usage=True,
+            )
+            if has_gpu:
+                # Best‑effort attempt to toggle flash after load
+                try:
+                    model.set_attn_implementation("flash_attention_2")
+                except AttributeError:
+                    pass  # not supported — continue with default attn
 
-        def _try_load(enable_flash: bool):
-            try:
-                return AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    attn_implementation="flash_attention_2" if enable_flash else None,
-                    **common_kwargs,
-                )
-            except (TypeError, ValueError):
-                # Older Transformers or CPU‑only will error if enable_flash=True.
-                if enable_flash:
-                    return _try_load(False)
-                raise
-
-        model = _try_load(enable_flash=gpu_avail)
-
-        # If we are on GPU and had to disable flash in load‑time arg (old HF),
-        # attempt to enable it now via helper.
-        if gpu_avail:
-            try:
-                model.set_attn_implementation("flash_attention_2")
-            except AttributeError:
-                # Helper missing; the initial load already succeeded with flash.
-                pass
-
-            # Move back to CPU so the parent can share() cheaply.
-            model.to("cpu")
-            torch.cuda.empty_cache()
-
+        # Move back to CPU so children can .share_memory() without huge DMA.
+        model.to("cpu")
+        torch.cuda.empty_cache()
         return model
 
     # ------------------------------------------------------------------
-    # Forward pass (layer streaming)
+    # Forward (layer streaming)
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        micro_batch_size: int,
-        device: torch.device | None = None,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, micro_bs: int,
+                device: torch.device | None = None) -> torch.Tensor:
         device = device or self.device
-
-        # Slice into micro‑batches and ship to the compute device.
-        batches = [
-            input_ids[i : i + micro_batch_size].to(device)
-            for i in range(0, input_ids.size(0), micro_batch_size)
-        ]
+        # Split into micro‑batches for lower VRAM during embed pass.
+        micro_batches = [input_ids[i: i + micro_bs].to(device)
+                         for i in range(0, input_ids.size(0), micro_bs)]
 
         # ---- Embedding ----
         self.embed.to(device, non_blocking=True)
         hidden: List[torch.Tensor] = []
-        pos_ids_list: List[torch.Tensor] = []
-        for mb in batches:
+        pos_ids_lst: List[torch.Tensor] = []
+        for mb in micro_batches:
             seq_len = mb.size(1)
-            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(mb.size(0), -1)
+            pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(mb.size(0), -1)
             hidden.append(self.embed(mb))
-            pos_ids_list.append(pos_ids)
+            pos_ids_lst.append(pos)
         self.embed.to("cpu", non_blocking=True)
         torch.cuda.empty_cache()
 
-        # ---- Transformer layers ----
+        # ---- Transformer stack ----
         for layer in self.layers:
             layer.to(device, non_blocking=True)
-            next_hidden: List[torch.Tensor] = []
-            for h, pos in zip(hidden, pos_ids_list):
-                cos_sin = self.rotary_emb(h, pos)  # Qwen‑style rotary helper
-                out = layer(h, position_ids=pos, position_embeddings=cos_sin)
+            nxt: List[torch.Tensor] = []
+            for h, pos in zip(hidden, pos_ids_lst):
+                cs = self.rotary_emb(h, pos)          # cos/sin tuple (Qwen‑style helper)
+                out = layer(h, position_ids=pos, position_embeddings=cs)
                 out = out[0] if isinstance(out, tuple) else out
-                next_hidden.append(out)
-                del h, pos, cos_sin, out  # free memory early
-            hidden = next_hidden
+                nxt.append(out)
+                del h, pos, cs, out  # free as early as possible
+            hidden = nxt
             layer.to("cpu", non_blocking=True)
             torch.cuda.empty_cache()
 
@@ -162,18 +166,16 @@ class Streamer:
         self.lm_head.to("cpu", non_blocking=True)
         torch.cuda.empty_cache()
 
-        logits_tensor = torch.cat(logits, dim=0).to("cpu", non_blocking=True)
-        del logits, hidden
+        logits = torch.cat(logits, dim=0).to("cpu", non_blocking=True)
+        del hidden
         torch.cuda.empty_cache()
-        return logits_tensor
+        return logits
 
-
-# -------------------------------------------------------------------------
-# Sampling & helpers
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# KD multinomial sampling
+# ---------------------------------------------------------------------------
 
 def sample_distribution(logits: torch.Tensor, rounds: int):
-    """Sample tokens via the KD multinomial procedure."""
     probs = torch.softmax(logits, dim=-1)
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
@@ -190,70 +192,100 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
         probs_all.append(probs_seq)
     return ids_all, probs_all
 
+# ---------------------------------------------------------------------------
+# Data utilities
+# ---------------------------------------------------------------------------
 
-def collate_fn(examples, tokenizer, max_seq_len: int):
-    return tokenizer(
-        [ex["text"] for ex in examples],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_seq_len,
-    )
+def collate_fn(examples, tok, max_len):
+    return tok([ex["text"] for ex in examples], return_tensors="pt",
+               padding=True, truncation=True, max_length=max_len)
 
 
-def streaming_dataloader(ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: mp.Event | None = None):
+def streaming_dataloader(ds, tok, bs, max_len, shutdown: mp.Event | None = None):
     batch = []
-    for example in ds:
+    for ex in ds:
         if shutdown and shutdown.is_set():
             break
-        batch.append(example)
-        if len(batch) == batch_size:
-            yield collate_fn(batch, tokenizer, max_seq_len)
+        batch.append(ex)
+        if len(batch) == bs:
+            yield collate_fn(batch, tok, max_len)
             batch.clear()
             if shutdown and shutdown.is_set():
                 break
     if batch and not (shutdown and shutdown.is_set()):
-        yield collate_fn(batch, tokenizer, max_seq_len)
+        yield collate_fn(batch, tok, max_len)
 
-
-# -------------------------------------------------------------------------
-# Worker logic
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Worker entrypoint
+# ---------------------------------------------------------------------------
 
 def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
     global STREAMER, SHUTDOWN
     STREAMER = streamer
     SHUTDOWN = shutdown
 
-    def _handle_sigterm(signum, frame):
-        shutdown.set()
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGTERM, lambda *_: shutdown.set())
 
     device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     STREAMER.device = device
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    dataset = load_dataset(
-        args.dataset_name,
-        split=args.dataset_split,
-        token=args.hf_token,
-        streaming=True,
-    )
-    dataset = dataset.shard(num_shards=args.num_workers, index=rank)
 
-    dataloader = streaming_dataloader(dataset, tokenizer, args.batch_size, args.max_seq_len, shutdown)
+    tok = AutoTokenizer.from_pretrained(args.model_name)
+    ds = load_dataset(args.dataset_name, split=args.dataset_split, token=args.hf_token, streaming=True)
+    ds = ds.shard(num_shards=args.num_workers, index=rank)
 
-    all_records: List[dict] = []
-    total = 0
-    for batch in dataloader:
-        if SHUTDOWN.is_set():
+    loader = streaming_dataloader(ds, tok, args.batch_size, args.max_seq_len, shutdown)
+
+    records: List[dict] = []
+    seen = 0
+    for batch in loader:
+        if shutdown.is_set():
             break
         input_ids = batch["input_ids"]
         logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
         ids, probs = sample_distribution(logits, args.sampling_rounds)
         for i in range(len(input_ids)):
-            all_records.append(
-                {
-                    "input_ids": input_ids[i].tolist(),
-                    "sampled_ids": ids[i],
-                    "sampled_probs":
+            records.append({
+                "input_ids": input_ids[i].tolist(),
+                "sampled_ids": ids[i],
+                "sampled_probs": probs[i],
+            })
+        seen += len(input_ids)
+        if seen >= args.push_every:
+            Dataset.from_list(records).push_to_hub(args.output_repo, token=args.hf_token, append=True)
+            records.clear(); seen = 0
+        if shutdown.is_set():
+            break
+
+    if records and not shutdown.is_set():
+        Dataset.from_list(records).push_to_hub(args.output_repo, token=args.hf_token, append=True)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    # Hard disable autograd for the entire script
+    torch.set_grad_enabled(False)
+
+    args = parse_args()
+
+    ctx = mp.get_context("spawn")
+    shutdown = ctx.Event()
+    signal.signal(signal.SIGTERM, lambda *_: shutdown.set())
+
+    global STREAMER, SHUTDOWN
+    STREAMER = Streamer(args.model_name)
+    STREAMER.model.share_memory()  # after moving to CPU
+    SHUTDOWN = shutdown
+
+    if args.num_workers > 1:
+        procs = [ctx.Process(target=worker_main, args=(r, args, STREAMER, shutdown))
+                 for r in range(args.num_workers)]
+        for p in procs: p.start()
+        for p in procs: p.join()
+    else:
+        worker_main(0, args, STREAMER, shutdown)
+
+
+if __name__ == "__main__":
+    main()
