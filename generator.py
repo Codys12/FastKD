@@ -24,6 +24,7 @@ class Args:
     batch_size: int
     micro_batch_size: int
     sampling_rounds: int
+    sampling_temperature: float
     push_every: int
     max_seq_len: int
     hf_token: str | None = None
@@ -42,6 +43,12 @@ def parse_args() -> Args:
         type=int,
         default=50,
         help="Number of sampling rounds per token as in the paper",
+    )
+    parser.add_argument(
+        "--sampling_temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for importance sampling",
     )
     parser.add_argument("--push_every", type=int, default=1000)
     parser.add_argument("--max_seq_len", type=int, default=2048)
@@ -152,21 +159,29 @@ class Streamer:
         return torch.cat(results, dim=0)
 
 
-def sample_distribution(logits: torch.Tensor, rounds: int):
-    """Sample tokens using the random sampling procedure from the paper."""
-    probs = torch.softmax(logits, dim=-1)
+def sample_distribution(
+    logits: torch.Tensor, rounds: int, temperature: float = 1.0
+) -> tuple[list[list[list[int]]], list[list[list[float]]]]:
+    """Sample tokens using importance sampling as described in the paper."""
+    logits = logits.float()
+    p = torch.softmax(logits, dim=-1)
+    q = torch.softmax(logits / temperature, dim=-1)
+
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
-    bsz, seqlen, _ = probs.shape
+    bsz, seqlen, _ = p.shape
     for b in range(bsz):
-        ids_seq = []
-        probs_seq = []
+        ids_seq: List[List[int]] = []
+        probs_seq: List[List[float]] = []
         for s in range(seqlen):
-            p = probs[b, s]
-            samples = torch.multinomial(p, rounds, replacement=True)
+            p_row = p[b, s]
+            q_row = q[b, s]
+            samples = torch.multinomial(q_row, rounds, replacement=True)
             uniq, counts = torch.unique(samples, return_counts=True)
+            weights = counts.float() * (p_row[uniq] / q_row[uniq])
+            probs_norm = weights / weights.sum()
             ids_seq.append(uniq.cpu().tolist())
-            probs_seq.append((counts.float() / rounds).cpu().tolist())
+            probs_seq.append(probs_norm.cpu().tolist())
         ids_all.append(ids_seq)
         probs_all.append(probs_seq)
     return ids_all, probs_all
@@ -232,7 +247,9 @@ def main():
             break
         input_ids = batch["input_ids"]
         logits = STREAMER.forward(input_ids, args.micro_batch_size)
-        ids, probs = sample_distribution(logits, args.sampling_rounds)
+        ids, probs = sample_distribution(
+            logits, args.sampling_rounds, args.sampling_temperature
+        )
         for i in range(len(input_ids)):
             record = {
                 "input_ids": input_ids[i].tolist(),
