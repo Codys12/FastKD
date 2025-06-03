@@ -8,7 +8,7 @@ from typing import List
 
 import torch
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 
 STREAMER: "Streamer" | None = None
@@ -52,9 +52,14 @@ def parse_args() -> Args:
 
 class Streamer:
     def __init__(self, model_name: str):
+        # load on CPU without flash attention to avoid initialization issues
+        config = AutoConfig.from_pretrained(model_name)
+        config.attn_implementation = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map={"": "cpu"}, torch_dtype=torch.float16
+            model_name, config=config, device_map={"": "cpu"}, torch_dtype=torch.float16
         )
+        # enable flash attention in the config afterwards
+        self.model.config.attn_implementation = "flash_attention_2"
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
         self.lm_head = self.model.lm_head
@@ -89,16 +94,54 @@ class Streamer:
                 for i, mb in enumerate(group)
             ]
 
-            for layer in [self.embed, *self.layers, self.lm_head]:
+            # embedding layer
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                stream = self.streams[i]
+                with torch.cuda.stream(stream):
+                    self.embed.to(dev, non_blocking=True)
+                    hidden[i] = self.embed(hidden[i])
+                    self.embed.to("cpu", non_blocking=True)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
+
+            # prepare position embeddings per micro batch
+            position_ids = []
+            cache_positions = []
+            pos_embeds = []
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                seq_len = hidden[i].size(1)
+                cache_pos = torch.arange(seq_len, device=dev)
+                pos_id = cache_pos.unsqueeze(0)
+                position_ids.append(pos_id)
+                cache_positions.append(cache_pos)
+                pos_embeds.append(self.model.model.rotary_emb(hidden[i], pos_id))
+
+            # transformer layers
+            for layer in self.layers:
                 for i, dev in enumerate(self.devices[: len(hidden)]):
                     stream = self.streams[i]
                     with torch.cuda.stream(stream):
                         layer.to(dev, non_blocking=True)
-                        out = layer(hidden[i])
+                        out = layer(
+                            hidden[i],
+                            position_ids=position_ids[i],
+                            cache_position=cache_positions[i],
+                            position_embeddings=pos_embeds[i],
+                        )
                         hidden[i] = out[0] if isinstance(out, tuple) else out
                         layer.to("cpu", non_blocking=True)
                 for s in self.streams[: len(hidden)]:
                     s.synchronize()
+
+            # lm head
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                stream = self.streams[i]
+                with torch.cuda.stream(stream):
+                    self.lm_head.to(dev, non_blocking=True)
+                    hidden[i] = self.lm_head(hidden[i])
+                    self.lm_head.to("cpu", non_blocking=True)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
 
             for i, dev in enumerate(self.devices[: len(hidden)]):
                 hidden[i] = hidden[i].to("cpu", non_blocking=True)
