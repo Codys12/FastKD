@@ -270,14 +270,14 @@ def main():
         total += len(input_ids)
         if total >= args.push_every:
             ds = Dataset.from_list(all_records)
-            ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
+            ds.push_to_hub(args.output_repo, token=args.hf_token)
             all_records.clear()
             total = 0
         if SHUTDOWN.is_set():
             break
     if all_records and not SHUTDOWN.is_set():
         ds = Dataset.from_list(all_records)
-        ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
+        ds.push_to_hub(args.output_repo, token=args.hf_token)
 
 
 if __name__ == "__main__":
