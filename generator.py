@@ -53,60 +53,67 @@ def parse_args() -> Args:
 
 
 class Streamer:
-    """Handles streaming forward‑passes one micro‑batch at a time."""
+    """Streams forward‑passes with minimal VRAM via layer‑at‑a‑time transfers."""
 
     def __init__(self, model_name: str):
+        # Load once in the parent, then share() so workers fork‑reuse the weights.
+        # We *must* initialise on GPU to satisfy the Flash‑Attn safety check, then
+        # immediately move everything back to CPU so sharing works without OOMs.
         self.model = self._load_model(model_name)
-        self.model.eval()  # inference‑only
+        self.model.eval()
 
-        self.device = torch.device("cpu")  # will be set per‑worker later
+        # These handles simplify later bookkeeping.
+        self.device = torch.device("cpu")  # set per‑worker later
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
-        self.rotary_emb = self.model.model.rotary_emb  # FIX 1: keep a handle to rotary emb
+        self.rotary_emb = self.model.model.rotary_emb
         self.lm_head = self.model.lm_head
 
-    # ---------------------------------------------------------------------
-    # Loading utilities
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Model loading helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _load_model(model_name: str):
-        """Load the model, enabling Flash‑Attn only when a GPU is present.
-
-        We first *try* to request Flash‑Attn at load‑time.  If the Transformers
-        safety check refuses because the device map is CPU‑only, we reload
-        without Flash‑Attn and then enable it post‑hoc via
-        ``model.set_attn_implementation`` (which skips the check).
+        """Initialise the model on GPU (if present) to get Flash‑Attn, then
+        relocate weights to CPU for shared‑memory use.
         """
 
-        common_kwargs = dict(
-            torch_dtype=torch.float16,
-            device_map={"": "cpu"},  # start on CPU, we stream layers to GPU
-            low_cpu_mem_usage=True,
-        )
+        gpu_avail = torch.cuda.is_available()
+        device_map_start = {"": "cuda:0"} if gpu_avail else {"": "cpu"}
+        common_kwargs = dict(torch_dtype=torch.float16, device_map=device_map_start, low_cpu_mem_usage=True)
 
-        try:
-            return AutoModelForCausalLM.from_pretrained(
-                model_name,
-                attn_implementation="flash_attention_2",
-                **common_kwargs,
-            )
-        except ValueError as err:
-            if "Flash Attention 2.0" not in str(err):
-                raise  # unrelated error, re‑raise
+        def _try_load(enable_flash: bool):
+            try:
+                return AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    attn_implementation="flash_attention_2" if enable_flash else None,
+                    **common_kwargs,
+                )
+            except (TypeError, ValueError):
+                # Older Transformers or CPU‑only will error if enable_flash=True.
+                if enable_flash:
+                    return _try_load(False)
+                raise
 
-            # Fallback: load without Flash‑Attn, then enable it manually if
-            # a CUDA device exists.
-            model = AutoModelForCausalLM.from_pretrained(model_name, **common_kwargs)
-            if torch.cuda.is_available():
-                try:
-                    model.set_attn_implementation("flash_attention_2")
-                except AttributeError:
-                    # Older HF versions or models without the helper – ignore.
-                    pass
-            return model
+        model = _try_load(enable_flash=gpu_avail)
+
+        # If we are on GPU and had to disable flash in load‑time arg (old HF),
+        # attempt to enable it now via helper.
+        if gpu_avail:
+            try:
+                model.set_attn_implementation("flash_attention_2")
+            except AttributeError:
+                # Helper missing; the initial load already succeeded with flash.
+                pass
+
+            # Move back to CPU so the parent can share() cheaply.
+            model.to("cpu")
+            torch.cuda.empty_cache()
+
+        return model
 
     # ------------------------------------------------------------------
-    # Forward pass
+    # Forward pass (layer streaming)
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(
@@ -117,7 +124,7 @@ class Streamer:
     ) -> torch.Tensor:
         device = device or self.device
 
-        # Split into micro‑batches and move to compute device
+        # Slice into micro‑batches and ship to the compute device.
         batches = [
             input_ids[i : i + micro_batch_size].to(device)
             for i in range(0, input_ids.size(0), micro_batch_size)
@@ -129,9 +136,7 @@ class Streamer:
         pos_ids_list: List[torch.Tensor] = []
         for mb in batches:
             seq_len = mb.size(1)
-            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
-                mb.size(0), -1
-            )
+            pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(mb.size(0), -1)
             hidden.append(self.embed(mb))
             pos_ids_list.append(pos_ids)
         self.embed.to("cpu", non_blocking=True)
@@ -142,13 +147,11 @@ class Streamer:
             layer.to(device, non_blocking=True)
             next_hidden: List[torch.Tensor] = []
             for h, pos in zip(hidden, pos_ids_list):
-                # FIX 2: compute (cos, sin) tuple exactly as Qwen3Model expects
-                cos_sin = self.rotary_emb(h, pos)
+                cos_sin = self.rotary_emb(h, pos)  # Qwen‑style rotary helper
                 out = layer(h, position_ids=pos, position_embeddings=cos_sin)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
-                # free per‑token activations early
-                del h, pos, cos_sin, out
+                del h, pos, cos_sin, out  # free memory early
             hidden = next_hidden
             layer.to("cpu", non_blocking=True)
             torch.cuda.empty_cache()
@@ -160,7 +163,7 @@ class Streamer:
         torch.cuda.empty_cache()
 
         logits_tensor = torch.cat(logits, dim=0).to("cpu", non_blocking=True)
-        del logits, hidden  # encourage GC & VRAM release
+        del logits, hidden
         torch.cuda.empty_cache()
         return logits_tensor
 
@@ -170,7 +173,7 @@ class Streamer:
 # -------------------------------------------------------------------------
 
 def sample_distribution(logits: torch.Tensor, rounds: int):
-    """Sample tokens via the paper's multinomial procedure."""
+    """Sample tokens via the KD multinomial procedure."""
     probs = torch.softmax(logits, dim=-1)
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
@@ -243,4 +246,14 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
     all_records: List[dict] = []
     total = 0
     for batch in dataloader:
-        if SHUTDOWN.is
+        if SHUTDOWN.is_set():
+            break
+        input_ids = batch["input_ids"]
+        logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
+        ids, probs = sample_distribution(logits, args.sampling_rounds)
+        for i in range(len(input_ids)):
+            all_records.append(
+                {
+                    "input_ids": input_ids[i].tolist(),
+                    "sampled_ids": ids[i],
+                    "sampled_probs":
