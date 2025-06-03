@@ -11,7 +11,6 @@ import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-
 STREAMER: "Streamer" | None = None
 SHUTDOWN: mp.Event | None = None
 
@@ -55,15 +54,30 @@ def parse_args() -> Args:
 
 class Streamer:
     def __init__(self, model_name: str):
+        # Prefer flash‑attention if supported by the model
+        model_kwargs = {
+            "device_map": {"": "cpu"},
+            "torch_dtype": torch.float16,
+        }
+        try:
+            # Transformers >= 4.39 supports the attn_implementation kwarg
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                attn_implementation="flash_attention_2",
+                **model_kwargs,
+            )
+        except TypeError:
+            # Fallback for older versions or configs that do not accept the kwarg
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+        self.model.eval()  # inference mode
         self.device = torch.device("cpu")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map={"": "cpu"}, torch_dtype=torch.float16
-        )
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
-        self.rotary_emb = self.model.model.rotary_emb            # FIX 1: keep a handle to rotary emb
+        self.rotary_emb = self.model.model.rotary_emb  # FIX 1: keep a handle to rotary emb
         self.lm_head = self.model.lm_head
 
+    @torch.inference_mode()  # ensure forward runs without gradient tracking
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -76,6 +90,7 @@ class Streamer:
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
+        # --- Embedding ---
         self.embed.to(device)
         hidden: List[torch.Tensor] = []
         pos_ids_list: List[torch.Tensor] = []
@@ -89,6 +104,7 @@ class Streamer:
         self.embed.to("cpu")
         torch.cuda.empty_cache()
 
+        # --- Transformer layers ---
         for layer in self.layers:
             layer.to(device)
             next_hidden: List[torch.Tensor] = []
@@ -102,16 +118,24 @@ class Streamer:
                 )
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
+                # Clear intermediate h as soon as it's no longer needed
+                del h, pos, cos_sin, out
             hidden = next_hidden
             layer.to("cpu")
             torch.cuda.empty_cache()
 
+        # --- LM head ---
         self.lm_head.to(device)
         logits = [self.lm_head(h) for h in hidden]
         self.lm_head.to("cpu")
         torch.cuda.empty_cache()
 
-        return torch.cat(logits, dim=0)
+        # Move logits to CPU to free VRAM early and clear hidden activations
+        logits_tensor = torch.cat(logits, dim=0).to("cpu")
+        del logits, hidden  # allow GC to reclaim GPU memory
+        torch.cuda.empty_cache()
+
+        return logits_tensor
 
 
 def sample_distribution(logits: torch.Tensor, rounds: int):
@@ -135,7 +159,7 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
     return tokenizer(
-        [ex["text"] for ex in examples],  # robust list-of-dicts handling
+        [ex["text"] for ex in examples],  # robust list‑of‑dicts handling
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -218,6 +242,7 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
 
 
 def main():
+    torch.set_grad_enabled(False)  # global inference mode safeguard
     args = parse_args()
 
     mp_context = mp.get_context("spawn")
