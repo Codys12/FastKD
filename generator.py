@@ -63,7 +63,7 @@ class Streamer:
         config = AutoConfig.from_pretrained(model_name)
         config.attn_implementation = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, config=config, device_map={"": "cpu"}, torch_dtype=torch.float16
+            model_name, config=config, device_map={"": "cpu"}, torch_dtype=torch.bfloat16
         )
         # enable flash attention in the config afterwards
         self.model.config.attn_implementation = "flash_attention_2"
