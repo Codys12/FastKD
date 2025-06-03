@@ -176,6 +176,16 @@ def sample_distribution(
         for s in range(seqlen):
             p_row = p[b, s]
             q_row = q[b, s]
+
+            # sanitize proposal to avoid invalid distributions
+            q_row = torch.nan_to_num(q_row, nan=0.0, posinf=0.0, neginf=0.0)
+            q_row = torch.clamp(q_row, min=0)
+            if not torch.isfinite(q_row).all() or q_row.sum() == 0:
+                q_row.fill_(1.0 / q_row.numel())
+            else:
+                q_row /= q_row.sum()
+
+            # multinomial expects non-negative weights
             samples = torch.multinomial(q_row, rounds, replacement=True)
             uniq, counts = torch.unique(samples, return_counts=True)
             weights = counts.float() * (p_row[uniq] / q_row[uniq])
