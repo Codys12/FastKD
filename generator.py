@@ -53,31 +53,62 @@ def parse_args() -> Args:
 
 
 class Streamer:
-    def __init__(self, model_name: str):
-        # Prefer flash‑attention if supported by the model
-        model_kwargs = {
-            "device_map": {"": "cpu"},
-            "torch_dtype": torch.float16,
-        }
-        try:
-            # Transformers >= 4.39 supports the attn_implementation kwarg
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                attn_implementation="flash_attention_2",
-                **model_kwargs,
-            )
-        except TypeError:
-            # Fallback for older versions or configs that do not accept the kwarg
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    """Handles streaming forward‑passes one micro‑batch at a time."""
 
-        self.model.eval()  # inference mode
-        self.device = torch.device("cpu")
+    def __init__(self, model_name: str):
+        self.model = self._load_model(model_name)
+        self.model.eval()  # inference‑only
+
+        self.device = torch.device("cpu")  # will be set per‑worker later
         self.layers = list(self.model.model.layers)
         self.embed = self.model.model.embed_tokens
-        self.rotary_emb = self.model.model.rotary_emb  # FIX 1: keep a handle to rotary emb
+        self.rotary_emb = self.model.model.rotary_emb  # FIX 1: keep a handle to rotary emb
         self.lm_head = self.model.lm_head
 
-    @torch.inference_mode()  # ensure forward runs without gradient tracking
+    # ---------------------------------------------------------------------
+    # Loading utilities
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _load_model(model_name: str):
+        """Load the model, enabling Flash‑Attn only when a GPU is present.
+
+        We first *try* to request Flash‑Attn at load‑time.  If the Transformers
+        safety check refuses because the device map is CPU‑only, we reload
+        without Flash‑Attn and then enable it post‑hoc via
+        ``model.set_attn_implementation`` (which skips the check).
+        """
+
+        common_kwargs = dict(
+            torch_dtype=torch.float16,
+            device_map={"": "cpu"},  # start on CPU, we stream layers to GPU
+            low_cpu_mem_usage=True,
+        )
+
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                model_name,
+                attn_implementation="flash_attention_2",
+                **common_kwargs,
+            )
+        except ValueError as err:
+            if "Flash Attention 2.0" not in str(err):
+                raise  # unrelated error, re‑raise
+
+            # Fallback: load without Flash‑Attn, then enable it manually if
+            # a CUDA device exists.
+            model = AutoModelForCausalLM.from_pretrained(model_name, **common_kwargs)
+            if torch.cuda.is_available():
+                try:
+                    model.set_attn_implementation("flash_attention_2")
+                except AttributeError:
+                    # Older HF versions or models without the helper – ignore.
+                    pass
+            return model
+
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -85,13 +116,15 @@ class Streamer:
         device: torch.device | None = None,
     ) -> torch.Tensor:
         device = device or self.device
+
+        # Split into micro‑batches and move to compute device
         batches = [
             input_ids[i : i + micro_batch_size].to(device)
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
-        # --- Embedding ---
-        self.embed.to(device)
+        # ---- Embedding ----
+        self.embed.to(device, non_blocking=True)
         hidden: List[torch.Tensor] = []
         pos_ids_list: List[torch.Tensor] = []
         for mb in batches:
@@ -101,45 +134,43 @@ class Streamer:
             )
             hidden.append(self.embed(mb))
             pos_ids_list.append(pos_ids)
-        self.embed.to("cpu")
+        self.embed.to("cpu", non_blocking=True)
         torch.cuda.empty_cache()
 
-        # --- Transformer layers ---
+        # ---- Transformer layers ----
         for layer in self.layers:
-            layer.to(device)
+            layer.to(device, non_blocking=True)
             next_hidden: List[torch.Tensor] = []
             for h, pos in zip(hidden, pos_ids_list):
-                # FIX 2: compute (cos, sin) tuple the same way Qwen3Model does
+                # FIX 2: compute (cos, sin) tuple exactly as Qwen3Model expects
                 cos_sin = self.rotary_emb(h, pos)
-                out = layer(
-                    h,
-                    position_ids=pos,
-                    position_embeddings=cos_sin,
-                )
+                out = layer(h, position_ids=pos, position_embeddings=cos_sin)
                 out = out[0] if isinstance(out, tuple) else out
                 next_hidden.append(out)
-                # Clear intermediate h as soon as it's no longer needed
+                # free per‑token activations early
                 del h, pos, cos_sin, out
             hidden = next_hidden
-            layer.to("cpu")
+            layer.to("cpu", non_blocking=True)
             torch.cuda.empty_cache()
 
-        # --- LM head ---
-        self.lm_head.to(device)
+        # ---- LM head ----
+        self.lm_head.to(device, non_blocking=True)
         logits = [self.lm_head(h) for h in hidden]
-        self.lm_head.to("cpu")
+        self.lm_head.to("cpu", non_blocking=True)
         torch.cuda.empty_cache()
 
-        # Move logits to CPU to free VRAM early and clear hidden activations
-        logits_tensor = torch.cat(logits, dim=0).to("cpu")
-        del logits, hidden  # allow GC to reclaim GPU memory
+        logits_tensor = torch.cat(logits, dim=0).to("cpu", non_blocking=True)
+        del logits, hidden  # encourage GC & VRAM release
         torch.cuda.empty_cache()
-
         return logits_tensor
 
 
+# -------------------------------------------------------------------------
+# Sampling & helpers
+# -------------------------------------------------------------------------
+
 def sample_distribution(logits: torch.Tensor, rounds: int):
-    """Sample tokens using the random sampling procedure from the paper."""
+    """Sample tokens via the paper's multinomial procedure."""
     probs = torch.softmax(logits, dim=-1)
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
@@ -159,7 +190,7 @@ def sample_distribution(logits: torch.Tensor, rounds: int):
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
     return tokenizer(
-        [ex["text"] for ex in examples],  # robust list‑of‑dicts handling
+        [ex["text"] for ex in examples],
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -167,9 +198,7 @@ def collate_fn(examples, tokenizer, max_seq_len: int):
     )
 
 
-def streaming_dataloader(
-    ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: mp.Event | None = None
-):
+def streaming_dataloader(ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: mp.Event | None = None):
     batch = []
     for example in ds:
         if shutdown and shutdown.is_set():
@@ -184,6 +213,10 @@ def streaming_dataloader(
         yield collate_fn(batch, tokenizer, max_seq_len)
 
 
+# -------------------------------------------------------------------------
+# Worker logic
+# -------------------------------------------------------------------------
+
 def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
     global STREAMER, SHUTDOWN
     STREAMER = streamer
@@ -193,9 +226,8 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
         shutdown.set()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    device = (
-        torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
-    )
+
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     STREAMER.device = device
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     dataset = load_dataset(
@@ -206,71 +238,9 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
     )
     dataset = dataset.shard(num_shards=args.num_workers, index=rank)
 
-    dataloader = streaming_dataloader(
-        dataset, tokenizer, args.batch_size, args.max_seq_len, shutdown
-    )
+    dataloader = streaming_dataloader(dataset, tokenizer, args.batch_size, args.max_seq_len, shutdown)
 
     all_records: List[dict] = []
     total = 0
     for batch in dataloader:
-        if SHUTDOWN.is_set():
-            break
-        input_ids = batch["input_ids"]
-        logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
-        ids, probs = sample_distribution(logits, args.sampling_rounds)
-        for i in range(len(input_ids)):
-            all_records.append(
-                {
-                    "input_ids": input_ids[i].tolist(),
-                    "sampled_ids": ids[i],
-                    "sampled_probs": probs[i],
-                }
-            )
-        total += len(input_ids)
-        if total >= args.push_every:
-            Dataset.from_list(all_records).push_to_hub(
-                args.output_repo, token=args.hf_token, append=True
-            )
-            all_records.clear()
-            total = 0
-        if SHUTDOWN.is_set():
-            break
-    if all_records and not SHUTDOWN.is_set():
-        Dataset.from_list(all_records).push_to_hub(
-            args.output_repo, token=args.hf_token, append=True
-        )
-
-
-def main():
-    torch.set_grad_enabled(False)  # global inference mode safeguard
-    args = parse_args()
-
-    mp_context = mp.get_context("spawn")
-    shutdown_event = mp_context.Event()
-
-    def _handle_sigterm(signum, frame):
-        shutdown_event.set()
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
-    global STREAMER, SHUTDOWN
-    SHUTDOWN = shutdown_event
-    STREAMER = Streamer(args.model_name)
-    STREAMER.model.share_memory()
-
-    if args.num_workers > 1:
-        processes = []
-        for rank in range(args.num_workers):
-            p = mp_context.Process(
-                target=worker_main, args=(rank, args, STREAMER, shutdown_event)
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
-    else:
-        worker_main(0, args, STREAMER, shutdown_event)
-
-
-if __name__ == "__main__":
-    main()
+        if SHUTDOWN.is
