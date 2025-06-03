@@ -16,6 +16,8 @@ import argparse
 import signal
 from dataclasses import dataclass
 from typing import List
+import json
+import os
 
 import torch
 import torch.multiprocessing as mp
@@ -225,6 +227,8 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
 
     records: List[dict] = []
     seen = 0
+    output_file = f"worker_{rank}.jsonl"
+    out_f = open(output_file, "w")
     for batch in loader:
         if shutdown.is_set():
             break
@@ -239,13 +243,18 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
             })
         seen += len(input_ids)
         if seen >= args.push_every:
-            Dataset.from_list(records).push_to_hub(args.output_repo, token=args.hf_token, append=True)
+            for rec in records:
+                out_f.write(json.dumps(rec) + "\n")
+            out_f.flush()
             records.clear(); seen = 0
         if shutdown.is_set():
             break
 
     if records and not shutdown.is_set():
-        Dataset.from_list(records).push_to_hub(args.output_repo, token=args.hf_token, append=True)
+        for rec in records:
+            out_f.write(json.dumps(rec) + "\n")
+        out_f.flush()
+    out_f.close()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -273,6 +282,24 @@ def main():
         for p in procs: p.join()
     else:
         worker_main(0, args, STREAMER, shutdown)
+
+    # Consolidate all worker outputs and push once to the hub
+    ds_list = []
+    for r in range(args.num_workers):
+        fname = f"worker_{r}.jsonl"
+        if os.path.exists(fname):
+            ds = load_dataset("json", data_files=fname, split="train")
+            ds_list.append(ds)
+    if ds_list:
+        combined = ds_list[0]
+        if len(ds_list) > 1:
+            from datasets import concatenate_datasets
+            combined = concatenate_datasets(ds_list)
+        combined.push_to_hub(args.output_repo, token=args.hf_token)
+    for r in range(args.num_workers):
+        fname = f"worker_{r}.jsonl"
+        if os.path.exists(fname):
+            os.remove(fname)
 
 
 if __name__ == "__main__":
