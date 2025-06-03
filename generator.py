@@ -83,43 +83,31 @@ class Streamer:
     # ------------------------------------------------------------------
     @staticmethod
     def _bootstrap_model(model_name: str):
-        """Load the model with Flash‑Attention enabled.
+        """Load the model on **CPU** *without* Flash‑Attention, then (optionally)
+        switch to Flash‑Attention 2 afterwards.
 
-        Workflow:
-        1. If a CUDA device exists, load directly onto GPU with
-           `attn_implementation="flash_attention_2"`.
-        2. Immediately move *all* weights back to CPU so the parent process can
-           `share_memory()` them cheaply for forked workers.
-        3. If *no* GPU is present, fall back to plain attention on CPU.
+        Loading directly on CPU avoids any GPU allocation during
+        deserialization.  After the model is instantiated we attempt a
+        best‑effort call to ``set_attn_implementation('flash_attention_2')`` so
+        that child workers moving layers to GPU can benefit from Flash‑Attention
+        without reloading the weights.
         """
-        has_gpu = torch.cuda.is_available()
-        dev_map = {"": "cuda:0"} if has_gpu else {"": "cpu"}
+        # Always start on CPU to minimise VRAM usage during load.
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map={"": "cpu"},
+            low_cpu_mem_usage=True,
+        )
 
+        # Try to enable Flash‑Attention 2 after loading (still on CPU).
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map=dev_map,
-                attn_implementation="flash_attention_2" if has_gpu else None,
-                low_cpu_mem_usage=True,
-            )
-        except ValueError:
-            # Older Transformers that error on the explicit kwarg — load without.
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map=dev_map,
-                low_cpu_mem_usage=True,
-            )
-            if has_gpu:
-                # Best‑effort attempt to toggle flash after load
-                try:
-                    model.set_attn_implementation("flash_attention_2")
-                except AttributeError:
-                    pass  # not supported — continue with default attn
+            model.set_attn_implementation("flash_attention_2")
+        except AttributeError:
+            # Model or transformers version does not support dynamic switching;
+            # fall back to the default attention implementation.
+            pass
 
-        # Move back to CPU so children can .share_memory() without huge DMA.
-        model.to("cpu")
         torch.cuda.empty_cache()
         return model
 
