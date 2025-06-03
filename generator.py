@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import os
 import signal
-import torch.multiprocessing as mp
+import threading
 from dataclasses import dataclass
 from typing import List
 
@@ -13,7 +12,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 STREAMER: "Streamer" | None = None
-SHUTDOWN: mp.Event | None = None
+SHUTDOWN: threading.Event | None = None
 
 
 @dataclass
@@ -27,7 +26,6 @@ class Args:
     sampling_rounds: int
     push_every: int
     max_seq_len: int
-    num_workers: int
     hf_token: str | None = None
 
 
@@ -47,7 +45,6 @@ def parse_args() -> Args:
     )
     parser.add_argument("--push_every", type=int, default=1000)
     parser.add_argument("--max_seq_len", type=int, default=2048)
-    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--hf_token", default=None)
     args = parser.parse_args()
     return Args(**vars(args))
@@ -55,7 +52,6 @@ def parse_args() -> Args:
 
 class Streamer:
     def __init__(self, model_name: str):
-        self.device = torch.device("cpu")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, device_map={"": "cpu"}, torch_dtype=torch.float16
         )
@@ -63,40 +59,54 @@ class Streamer:
         self.embed = self.model.model.embed_tokens
         self.lm_head = self.model.lm_head
 
+        self.devices = [
+            torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())
+        ]
+        if not self.devices:
+            self.devices = [torch.device("cpu")]
+        self.num_devices = len(self.devices)
+
+        if torch.cuda.device_count() > 0:
+            self.streams = [torch.cuda.Stream(device=d) for d in self.devices]
+        else:
+            self.streams = [torch.cuda.current_stream()]
+
     def forward(
         self,
         input_ids: torch.Tensor,
         micro_batch_size: int,
-        device: torch.device | None = None,
     ) -> torch.Tensor:
-        device = device or self.device
         batches = [
-            input_ids[i : i + micro_batch_size].to(device)
+            input_ids[i : i + micro_batch_size]
             for i in range(0, input_ids.size(0), micro_batch_size)
         ]
 
-        self.embed.to(device)
-        hidden = [self.embed(mb) for mb in batches]
-        self.embed.to("cpu")
-        torch.cuda.empty_cache()
+        results: List[torch.Tensor] = []
+        for start in range(0, len(batches), self.num_devices):
+            group = batches[start : start + self.num_devices]
+            hidden = [
+                mb.to(self.devices[i], non_blocking=True)
+                for i, mb in enumerate(group)
+            ]
 
-        for layer in self.layers:
-            layer.to(device)
-            next_hidden = []
-            for h in hidden:
-                out = layer(h)
-                out = out[0] if isinstance(out, tuple) else out
-                next_hidden.append(out)
-            hidden = next_hidden
-            layer.to("cpu")
-            torch.cuda.empty_cache()
+            for layer in [self.embed, *self.layers, self.lm_head]:
+                for i, dev in enumerate(self.devices[: len(hidden)]):
+                    stream = self.streams[i]
+                    with torch.cuda.stream(stream):
+                        layer.to(dev, non_blocking=True)
+                        out = layer(hidden[i])
+                        hidden[i] = out[0] if isinstance(out, tuple) else out
+                        layer.to("cpu", non_blocking=True)
+                for s in self.streams[: len(hidden)]:
+                    s.synchronize()
 
-        self.lm_head.to(device)
-        logits = [self.lm_head(h) for h in hidden]
-        self.lm_head.to("cpu")
-        torch.cuda.empty_cache()
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                hidden[i] = hidden[i].to("cpu", non_blocking=True)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
+            results.extend(hidden)
 
-        return torch.cat(logits, dim=0)
+        return torch.cat(results, dim=0)
 
 
 def sample_distribution(logits: torch.Tensor, rounds: int):
@@ -130,7 +140,7 @@ def collate_fn(examples, tokenizer, max_seq_len: int):
 
 
 def streaming_dataloader(
-    ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: mp.Event | None = None
+    ds, tokenizer, batch_size: int, max_seq_len: int, shutdown: threading.Event | None = None
 ):
     batch = []
     for example in ds:
@@ -146,19 +156,19 @@ def streaming_dataloader(
         yield collate_fn(batch, tokenizer, max_seq_len)
 
 
-def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
+def main():
+    args = parse_args()
+
     global STREAMER, SHUTDOWN
-    STREAMER = streamer
-    SHUTDOWN = shutdown
+    SHUTDOWN = threading.Event()
 
     def _handle_sigterm(signum, frame):
-        shutdown.set()
+        SHUTDOWN.set()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    device = (
-        torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
-    )
-    STREAMER.device = device
+
+    STREAMER = Streamer(args.model_name)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     dataset = load_dataset(
         args.dataset_name,
@@ -166,10 +176,9 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
         token=args.hf_token,
         streaming=True,
     )
-    dataset = dataset.shard(num_shards=args.num_workers, index=rank)
 
     dataloader = streaming_dataloader(
-        dataset, tokenizer, args.batch_size, args.max_seq_len, shutdown
+        dataset, tokenizer, args.batch_size, args.max_seq_len, SHUTDOWN
     )
 
     all_records: List[dict] = []
@@ -178,7 +187,7 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
         if SHUTDOWN.is_set():
             break
         input_ids = batch["input_ids"]
-        logits = STREAMER.forward(input_ids, args.micro_batch_size, device)
+        logits = STREAMER.forward(input_ids, args.micro_batch_size)
         ids, probs = sample_distribution(logits, args.sampling_rounds)
         for i in range(len(input_ids)):
             record = {
@@ -198,36 +207,6 @@ def worker_main(rank: int, args: Args, streamer: Streamer, shutdown: mp.Event):
     if all_records and not SHUTDOWN.is_set():
         ds = Dataset.from_list(all_records)
         ds.push_to_hub(args.output_repo, token=args.hf_token, append=True)
-
-
-def main():
-    args = parse_args()
-
-    mp_context = mp.get_context("spawn")
-    shutdown_event = mp_context.Event()
-
-    def _handle_sigterm(signum, frame):
-        shutdown_event.set()
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
-    global STREAMER, SHUTDOWN
-    SHUTDOWN = shutdown_event
-    STREAMER = Streamer(args.model_name)
-    STREAMER.model.share_memory()
-
-    if args.num_workers > 1:
-        processes = []
-        for rank in range(args.num_workers):
-            p = mp_context.Process(
-                target=worker_main, args=(rank, args, STREAMER, shutdown_event)
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
-    else:
-        worker_main(0, args, STREAMER, shutdown_event)
 
 
 if __name__ == "__main__":
