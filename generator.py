@@ -241,9 +241,12 @@ def sample_distribution(
                 probs_norm = weights / weight_sum
                 log_probs_norm = log_weights - m - torch.log(weight_sum)
 
-            ids_seq.append(uniq.cpu().tolist())
-            probs_seq.append(probs_norm.cpu().tolist())
-            logprobs_seq.append(log_probs_norm.cpu().tolist())
+            # remove zero-probability tokens
+            keep = probs_norm > 0
+
+            ids_seq.append(uniq[keep].cpu().tolist())
+            probs_seq.append(probs_norm[keep].cpu().tolist())
+            logprobs_seq.append(log_probs_norm[keep].cpu().tolist())
 
         ids_all.append(ids_seq)
         probs_all.append(probs_seq)
