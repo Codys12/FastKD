@@ -203,14 +203,23 @@ def sample_distribution(
             # multinomial expects non-negative weights
             samples = torch.multinomial(q_row, rounds, replacement=True)
             uniq, counts = torch.unique(samples, return_counts=True)
-            weights = counts.float() * (p_row[uniq] / q_row[uniq])
-            weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            # compute weights in log-space for numerical stability
+            eps = 1e-12
+            log_weights = (
+                counts.float().clamp_min(1).log()
+                + torch.log(p_row[uniq] + eps)
+                - torch.log(q_row[uniq] + eps)
+            )
+            log_weights = torch.nan_to_num(log_weights, nan=-float("inf"))
+            m = log_weights.max()
+            weights = torch.exp(log_weights - m)
             weight_sum = weights.sum()
             if not torch.isfinite(weight_sum) or weight_sum <= 0:
                 probs_norm = torch.full_like(weights, 1.0 / weights.numel())
+                log_probs_norm = torch.log(probs_norm + eps)
             else:
                 probs_norm = weights / weight_sum
-            log_probs_norm = torch.log(probs_norm + 1e-12)
+                log_probs_norm = log_weights - m - torch.log(weight_sum + eps)
             ids_seq.append(uniq.cpu().tolist())
             probs_seq.append(probs_norm.cpu().tolist())
             logprobs_seq.append(log_probs_norm.cpu().tolist())
