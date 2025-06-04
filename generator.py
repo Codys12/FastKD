@@ -183,6 +183,8 @@ def sample_distribution(
             if not torch.isfinite(q_row).all() or q_row.sum() == 0:
                 q_row.fill_(1.0 / q_row.numel())
             else:
+                # avoid zero probabilities that can cause degenerate sampling
+                q_row = q_row + 1e-6
                 q_row /= q_row.sum()
 
             # multinomial expects non-negative weights

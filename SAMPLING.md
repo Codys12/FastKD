@@ -13,7 +13,7 @@ The goal is to approximate the full softmax distribution of the teacher model wh
    - Given the raw logits for a sequence, compute the teacher distribution `p` via `softmax(logits)`.
    - Compute a proposal distribution `q` by applying temperature to the logits and then softmax: `q = softmax(logits / temperature)`.
    - Sampling temperatures in the range **0.8**–**1.2** generally give the lowest variance.
-   - Replace any `NaN` or infinite values in `q` with zero and clamp negative entries to `0`.  If the resulting distribution becomes degenerate (all zeros or non‑finite) fall back to a uniform distribution before normalising.
+   - Replace any `NaN` or infinite values in `q` with zero and clamp negative entries to `0`.  If the resulting distribution becomes degenerate (all zeros or non‑finite) fall back to a uniform distribution before normalising.  Otherwise add a small `1e-6` to avoid zero probabilities before normalising.
 
 2. **Draw Samples**
    - For every position in the sequence, draw `rounds` samples from `q` with replacement using `torch.multinomial`.
