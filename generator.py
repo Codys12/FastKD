@@ -319,11 +319,18 @@ def main():
             args.sampling_temperature,
         )
         for i in range(len(input_ids)):
+            # remove trailing padding tokens from the input sequence
+            tokens = input_ids[i].tolist()
+            while tokens and tokens[-1] == 0:
+                tokens.pop()
+
+            seq_len = len(tokens)
+
             record = {
-                "input_ids": input_ids[i].tolist(),
-                "sampled_ids": ids[i],
-                "sampled_probs": probs[i],
-                "sampled_logprobs": log_probs[i],
+                "input_ids": tokens,
+                "sampled_ids": ids[i][:seq_len],
+                "sampled_probs": probs[i][:seq_len],
+                "sampled_logprobs": log_probs[i][:seq_len],
             }
             all_records.append(record)
         total += len(input_ids)
