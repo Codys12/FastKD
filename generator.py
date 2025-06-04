@@ -328,6 +328,7 @@ def main():
             all_records.append(record)
         total += len(input_ids)
         if total >= args.push_every:
+            print("Example sampled_probs:", all_records[0]["sampled_probs"])
             ds = Dataset.from_list(all_records)
             ds.push_to_hub(args.output_repo, token=args.hf_token)
             all_records.clear()
