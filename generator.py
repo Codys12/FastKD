@@ -83,6 +83,7 @@ class Streamer:
         else:
             self.streams = [torch.cuda.current_stream()]
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
