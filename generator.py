@@ -189,7 +189,12 @@ def sample_distribution(
             samples = torch.multinomial(q_row, rounds, replacement=True)
             uniq, counts = torch.unique(samples, return_counts=True)
             weights = counts.float() * (p_row[uniq] / q_row[uniq])
-            probs_norm = weights / weights.sum()
+            weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            weight_sum = weights.sum()
+            if not torch.isfinite(weight_sum) or weight_sum <= 0:
+                probs_norm = torch.full_like(weights, 1.0 / weights.numel())
+            else:
+                probs_norm = weights / weight_sum
             ids_seq.append(uniq.cpu().tolist())
             probs_seq.append(probs_norm.cpu().tolist())
         ids_all.append(ids_seq)
