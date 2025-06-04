@@ -23,7 +23,8 @@ class Args:
     output_repo: str
     batch_size: int
     micro_batch_size: int
-    sampling_rounds: int
+    num_rounds: int        # ← renamed for clarity
+    num_samples: int       # ← NEW per-round sample count
     sampling_temperature: float
     push_every: int
     max_seq_len: int
@@ -39,16 +40,22 @@ def parse_args() -> Args:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument(
-        "--sampling_rounds",
+        "--num_rounds",
         type=int,
         default=50,
-        help="Number of sampling rounds per token as in the paper",
+        help="Number of sampling rounds (R in the paper).",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Tokens drawn per round (N in the paper).",
     )
     parser.add_argument(
         "--sampling_temperature",
         type=float,
         default=1.0,
-        help="Sampling temperature for importance sampling",
+        help="Sampling temperature (t).",
     )
     parser.add_argument("--push_every", type=int, default=1000)
     parser.add_argument("--max_seq_len", type=int, default=2048)
@@ -161,18 +168,24 @@ class Streamer:
 
 
 def sample_distribution(
-    logits: torch.Tensor, rounds: int, temperature: float = 1.0
+    logits: torch.Tensor,
+    num_samples: int,
+    num_rounds: int,
+    temperature: float = 1.0,
 ) -> tuple[
     list[list[list[int]]],
     list[list[list[float]]],
     list[list[list[float]]],
 ]:
-    """Sample tokens using importance sampling as described in the paper.
+    """
+    Importance-sample `num_samples` tokens per round from proposal q(x)
+    for `num_rounds` rounds, following the paper.  Probabilities are
+    accumulated across rounds and renormalized for each token position.
 
-    In addition to the normalized probabilities, the function also returns the
-    log probability of each sampled token.  This is useful when the teacher
-    distribution is extremely peaked and probabilities would otherwise underflow
-    to zero.
+    Returns:
+        ids_all        – sampled token IDs          (B × S × M)
+        probs_all      – normalized weights         (B × S × M)
+        log_probs_all  – log of normalized weights  (B × S × M)
     """
     logits = logits.float()
     p = torch.softmax(logits, dim=-1)
@@ -181,51 +194,61 @@ def sample_distribution(
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
     log_probs_all: List[List[List[float]]] = []
-    bsz, seqlen, _ = p.shape
+    bsz, seqlen, vocab = p.shape
+    eps = 1e-12
+
     for b in range(bsz):
         ids_seq: List[List[int]] = []
         probs_seq: List[List[float]] = []
         logprobs_seq: List[List[float]] = []
+
         for s in range(seqlen):
             p_row = p[b, s]
             q_row = q[b, s]
 
-            # sanitize proposal to avoid invalid distributions
+            # sanitize q to avoid invalid distributions
             q_row = torch.nan_to_num(q_row, nan=0.0, posinf=0.0, neginf=0.0)
             q_row = torch.clamp(q_row, min=0)
             if not torch.isfinite(q_row).all() or q_row.sum() == 0:
-                q_row.fill_(1.0 / q_row.numel())
+                q_row.fill_(1.0 / vocab)
             else:
-                # avoid zero probabilities that can cause degenerate sampling
-                q_row = q_row + 1e-6
+                q_row = q_row + 1e-6  # avoid exact zeros
                 q_row /= q_row.sum()
 
-            # multinomial expects non-negative weights
-            samples = torch.multinomial(q_row, rounds, replacement=True)
+            # sample N × R tokens in one shot (identical to R rounds of size N)
+            total_draws = num_samples * num_rounds
+            samples = torch.multinomial(q_row, total_draws, replacement=True)
+
             uniq, counts = torch.unique(samples, return_counts=True)
-            # compute weights in log-space for numerical stability
-            eps = 1e-12
+
+            # log-weight: log(m_i · p_i / q_i)
             log_weights = (
-                counts.float().clamp_min(1).log()
+                counts.float().log()
                 + torch.log(p_row[uniq] + eps)
                 - torch.log(q_row[uniq] + eps)
             )
             log_weights = torch.nan_to_num(log_weights, nan=-float("inf"))
+
+            # normalize weights in log-space for stability
             m = log_weights.max()
             weights = torch.exp(log_weights - m)
             weight_sum = weights.sum()
+
             if not torch.isfinite(weight_sum) or weight_sum <= 0:
                 probs_norm = torch.full_like(weights, 1.0 / weights.numel())
                 log_probs_norm = torch.log(probs_norm + eps)
             else:
                 probs_norm = weights / weight_sum
                 log_probs_norm = log_weights - m - torch.log(weight_sum + eps)
+
             ids_seq.append(uniq.cpu().tolist())
             probs_seq.append(probs_norm.cpu().tolist())
             logprobs_seq.append(log_probs_norm.cpu().tolist())
+
         ids_all.append(ids_seq)
         probs_all.append(probs_seq)
         log_probs_all.append(logprobs_seq)
+
     return ids_all, probs_all, log_probs_all
 
 
@@ -290,7 +313,10 @@ def main():
         input_ids = batch["input_ids"]
         logits = STREAMER.forward(input_ids, args.micro_batch_size)
         ids, probs, log_probs = sample_distribution(
-            logits, args.sampling_rounds, args.sampling_temperature
+            logits,
+            args.num_samples,
+            args.num_rounds,
+            args.sampling_temperature,
         )
         for i in range(len(input_ids)):
             record = {
