@@ -166,6 +166,99 @@ class Streamer:
 
         return torch.cat(results, dim=0)
 
+    @torch.no_grad()
+    def sample(
+        self,
+        input_ids: torch.Tensor,
+        micro_batch_size: int,
+        num_samples: int,
+        num_rounds: int,
+        temperature: float = 1.0,
+    ) -> tuple[
+        list[list[list[int]]],
+        list[list[list[float]]],
+        list[list[list[float]]],
+    ]:
+        """Run the model in microbatches and sample logits on-device."""
+        batches = [
+            input_ids[i : i + micro_batch_size]
+            for i in range(0, input_ids.size(0), micro_batch_size)
+        ]
+
+        ids_all: list[list[list[int]]] = []
+        probs_all: list[list[list[float]]] = []
+        logprobs_all: list[list[list[float]]] = []
+
+        for start in range(0, len(batches), self.num_devices):
+            group = batches[start : start + self.num_devices]
+            hidden = [
+                mb.to(self.devices[i], non_blocking=True)
+                for i, mb in enumerate(group)
+            ]
+
+            # embedding layer
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                stream = self.streams[i]
+                with torch.cuda.stream(stream):
+                    self.embed.to(dev, non_blocking=True)
+                    hidden[i] = self.embed(hidden[i])
+                    self.embed.to("cpu", non_blocking=True)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
+
+            # prepare position embeddings per micro batch
+            position_ids = []
+            cache_positions = []
+            pos_embeds = []
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                seq_len = hidden[i].size(1)
+                cache_pos = torch.arange(seq_len, device=dev)
+                pos_id = cache_pos.unsqueeze(0)
+                position_ids.append(pos_id)
+                cache_positions.append(cache_pos)
+                pos_embeds.append(self.model.model.rotary_emb(hidden[i], pos_id))
+
+            # transformer layers
+            for layer in self.layers:
+                for i, dev in enumerate(self.devices[: len(hidden)]):
+                    stream = self.streams[i]
+                    with torch.cuda.stream(stream):
+                        layer.to(dev, non_blocking=True)
+                        out = layer(
+                            hidden[i],
+                            position_ids=position_ids[i],
+                            cache_position=cache_positions[i],
+                            position_embeddings=pos_embeds[i],
+                        )
+                        hidden[i] = out[0] if isinstance(out, tuple) else out
+                        layer.to("cpu", non_blocking=True)
+                for s in self.streams[: len(hidden)]:
+                    s.synchronize()
+
+            # lm head
+            for i, dev in enumerate(self.devices[: len(hidden)]):
+                stream = self.streams[i]
+                with torch.cuda.stream(stream):
+                    self.lm_head.to(dev, non_blocking=True)
+                    hidden[i] = self.lm_head(hidden[i])
+                    self.lm_head.to("cpu", non_blocking=True)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
+
+            # sample logits on-device and move results to CPU
+            for h in hidden:
+                ids, probs, log_probs = sample_distribution(
+                    h,
+                    num_samples=num_samples,
+                    num_rounds=num_rounds,
+                    temperature=temperature,
+                )
+                ids_all.extend(ids)
+                probs_all.extend(probs)
+                logprobs_all.extend(log_probs)
+
+        return ids_all, probs_all, logprobs_all
+
 
 def sample_distribution(
     logits: torch.Tensor,
@@ -314,9 +407,9 @@ def main():
         if SHUTDOWN.is_set():
             break
         input_ids = batch["input_ids"]
-        logits = STREAMER.forward(input_ids, args.micro_batch_size)
-        ids, probs, log_probs = sample_distribution(
-            logits,
+        ids, probs, log_probs = STREAMER.sample(
+            input_ids,
+            args.micro_batch_size,
             args.num_samples,
             args.num_rounds,
             args.sampling_temperature,
