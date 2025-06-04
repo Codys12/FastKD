@@ -29,12 +29,13 @@ The goal is to approximate the full softmax distribution of the teacher model wh
    - Convert the weights to `float32`, replace any non‑finite values with zero and normalise them.  If the sum of weights is zero or not finite, fall back to a uniform distribution across the sampled tokens.
 
 4. **Store Results**
-   - For every position `s` in every sequence `b`, store two parallel lists:
-     - `sampled_ids[b][s]` – the token ids that were sampled.
-     - `sampled_probs[b][s]` – the normalized probability of each corresponding id.
-   - The number of unique tokens grows sub‑linearly with the number of rounds.  Fifty rounds typically yield around twelve unique tokens per position.
+    - For every position `s` in every sequence `b`, store two parallel lists:
+      - `sampled_ids[b][s]` – the token ids that were sampled.
+      - `sampled_probs[b][s]` – the normalized probability of each corresponding id.
+      - `sampled_logprobs[b][s]` – the logarithm of each normalized probability.
+    - The number of unique tokens grows sub‑linearly with the number of rounds.  Fifty rounds typically yield around twelve unique tokens per position.
 
-The function `sample_distribution` in `generator.py` implements the process above and returns the `sampled_ids` and `sampled_probs` structures. These results can then be serialized and used for knowledge distillation.
+The function `sample_distribution` in `generator.py` implements the process above and returns the `sampled_ids`, `sampled_probs` and `sampled_logprobs` structures. These results can then be serialized and used for knowledge distillation.
 
 ## Example
 
@@ -42,8 +43,8 @@ The function `sample_distribution` in `generator.py` implements the process abov
 from generator import sample_distribution
 
 logits = model(input_ids)                  # [batch, seq, vocab]
-ids, probs = sample_distribution(logits, rounds=50, temperature=1.0)
+ids, probs, logprobs = sample_distribution(logits, rounds=50, temperature=1.0)
 ```
 
-Each element of `ids[b][s]` matches a probability in `probs[b][s]`. This pair represents an unbiased approximation of the teacher distribution for token `s` in sequence `b`.
+Each element of `ids[b][s]` matches both a probability in `probs[b][s]` and a log probability in `logprobs[b][s]`. These pairs represent an unbiased approximation of the teacher distribution for token `s` in sequence `b`.
 

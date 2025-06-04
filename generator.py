@@ -161,18 +161,30 @@ class Streamer:
 
 def sample_distribution(
     logits: torch.Tensor, rounds: int, temperature: float = 1.0
-) -> tuple[list[list[list[int]]], list[list[list[float]]]]:
-    """Sample tokens using importance sampling as described in the paper."""
+) -> tuple[
+    list[list[list[int]]],
+    list[list[list[float]]],
+    list[list[list[float]]],
+]:
+    """Sample tokens using importance sampling as described in the paper.
+
+    In addition to the normalized probabilities, the function also returns the
+    log probability of each sampled token.  This is useful when the teacher
+    distribution is extremely peaked and probabilities would otherwise underflow
+    to zero.
+    """
     logits = logits.float()
     p = torch.softmax(logits, dim=-1)
     q = torch.softmax(logits / temperature, dim=-1)
 
     ids_all: List[List[List[int]]] = []
     probs_all: List[List[List[float]]] = []
+    log_probs_all: List[List[List[float]]] = []
     bsz, seqlen, _ = p.shape
     for b in range(bsz):
         ids_seq: List[List[int]] = []
         probs_seq: List[List[float]] = []
+        logprobs_seq: List[List[float]] = []
         for s in range(seqlen):
             p_row = p[b, s]
             q_row = q[b, s]
@@ -197,11 +209,14 @@ def sample_distribution(
                 probs_norm = torch.full_like(weights, 1.0 / weights.numel())
             else:
                 probs_norm = weights / weight_sum
+            log_probs_norm = torch.log(probs_norm + 1e-12)
             ids_seq.append(uniq.cpu().tolist())
             probs_seq.append(probs_norm.cpu().tolist())
+            logprobs_seq.append(log_probs_norm.cpu().tolist())
         ids_all.append(ids_seq)
         probs_all.append(probs_seq)
-    return ids_all, probs_all
+        log_probs_all.append(logprobs_seq)
+    return ids_all, probs_all, log_probs_all
 
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
@@ -264,7 +279,7 @@ def main():
             break
         input_ids = batch["input_ids"]
         logits = STREAMER.forward(input_ids, args.micro_batch_size)
-        ids, probs = sample_distribution(
+        ids, probs, log_probs = sample_distribution(
             logits, args.sampling_rounds, args.sampling_temperature
         )
         for i in range(len(input_ids)):
@@ -272,6 +287,7 @@ def main():
                 "input_ids": input_ids[i].tolist(),
                 "sampled_ids": ids[i],
                 "sampled_probs": probs[i],
+                "sampled_logprobs": log_probs[i],
             }
             all_records.append(record)
         total += len(input_ids)
