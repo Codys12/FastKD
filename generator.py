@@ -224,8 +224,8 @@ def sample_distribution(
             # log-weight: log(m_i · p_i / q_i)
             log_weights = (
                 counts.float().log()
-                + torch.log(p_row[uniq] + eps)
-                - torch.log(q_row[uniq] + eps)
+                + torch.log(p_row[uniq])
+                - torch.log(q_row[uniq])
             )
             log_weights = torch.nan_to_num(log_weights, nan=-float("inf"))
 
@@ -236,10 +236,10 @@ def sample_distribution(
 
             if not torch.isfinite(weight_sum) or weight_sum <= 0:
                 probs_norm = torch.full_like(weights, 1.0 / weights.numel())
-                log_probs_norm = torch.log(probs_norm + eps)
+                log_probs_norm = torch.log(probs_norm)
             else:
                 probs_norm = weights / weight_sum
-                log_probs_norm = log_weights - m - torch.log(weight_sum + eps)
+                log_probs_norm = log_weights - m - torch.log(weight_sum)
 
             ids_seq.append(uniq.cpu().tolist())
             probs_seq.append(probs_norm.cpu().tolist())
