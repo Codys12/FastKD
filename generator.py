@@ -1,33 +1,25 @@
-# generator_distributed.py – weight‑streaming pipeline version
-# Author: ChatGPT – June 2025
+# generator_distributed.py – weight‑streaming pipeline version
+# Author: ChatGPT – June 2025  ✨  (rev‑2)
 """
-This version replaces the hand‑rolled multi‑GPU logic with **torch.distributed**
-weight‑streaming pipelining.  Instead of moving *data* through fixed model
-stages, we keep a static shard of the batch on every GPU and **stream the
-layers** (weights) across devices.  Every layer processes up to
-`micro_batch_size` examples resident on each GPU before its parameters are sent
-on to the next rank.  All communications use `torch.distributed.broadcast`
-async ops so communication of the next layer overlaps compute of the current
-one.
+**Weight‑streaming, batch‑scoped**: Parameters are now broadcast **once per layer
+per full `batch_size`**, not once per `micro_batch_size`.  Each layer stays
+resident on the GPU while it marches through every micro‑batch in the batch,
+then is released.  This amortises communication over `batch_size /
+micro_batch_size` forwards and yields far fewer synchronisations.
 
-Key features
-------------
-* One process **per GPU** (launched with *torchrun*).
-* Dataset stream is **sharded by rank** (round‑robin) so every example is used
-  exactly once.
-* Embedding & LM‑head weights are **replicated once** at start‑up;
-  transformer block weights are streamed layer‑by‑layer.
-* Rank 0 collects sampled statistics from all ranks and pushes shards to the
-  Hub, avoiding write conflicts.
+High‑level flow per `sample()` on each rank
+------------------------------------------
+1. **Slice** the input tensor into micro‑batches on‐device.
+2. **Embed** every micro‑batch immediately (tokens → hidden) & build its rotary
+   position helpers; store in a small struct.
+3. **For each transformer block** *i*:
+   • Owner rank *i % world_size* brings the weights to GPU and broadcasts once.
+   • The block runs **sequentially over all resident micro‑batches**.
+   • Then weights are sent back to CPU & cache flushed.
+4. **lm_head** (already replicated) processes every micro‑batch → logits.
+5. `sample_distribution` draws multinomial samples; results concatenated.
 
-Caveats
--------
-* The naive broadcast of every layer to *all* ranks is simple but network‑heavy.
-  For larger clusters, you may prefer a ring or tree schedule.
-* The implementation relies on identical layer/buffer topologies on every
-  process – as is standard for decoder‑only LLMs.
-* Not yet rigorously profiled.  Tune ``micro_batch_size`` and overlap windows
-  for your fabric.
+Only the sampling utilities and data loader are unchanged.
 """
 from __future__ import annotations
 
@@ -45,7 +37,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from huggingface_hub import HfApi, Repository
 
 ################################################################################
-# Argument parsing                                                               
+# Argument parsing                                                              
 ################################################################################
 
 @dataclass
@@ -65,7 +57,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    parser = argparse.ArgumentParser(description="Generate KD dataset with distributed weight‑streaming")
+    parser = argparse.ArgumentParser(description="Generate KD dataset with distributed weight‑streaming (batch‑scoped)")
     parser.add_argument("--model_name", required=True)
     parser.add_argument("--dataset_name", required=True)
     parser.add_argument("--dataset_split", default="train")
@@ -82,52 +74,36 @@ def parse_args() -> Args:
     return Args(**vars(args))
 
 ################################################################################
-# Distributed helper                                                             
+# Distributed helper                                                            
 ################################################################################
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
-    """Initialise torch.distributed and return (local_rank, global_rank, world_size, device)."""
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-    return local_rank, dist.get_rank(), dist.get_world_size(), device
+    return local_rank, dist.get_rank(), dist.get_world_size(), torch.device(f"cuda:{local_rank}")
 
 ################################################################################
-# Sampling utilities                                                             
+# Sampling util                                                                 
 ################################################################################
 
-def sample_distribution(
-    logits: torch.Tensor,
-    num_samples: int,
-    num_rounds: int,
-    temperature: float = 1.0,
-):
-    """Return sampled token ids and raw counts for each position."""
+def sample_distribution(logits: torch.Tensor, num_samples: int, num_rounds: int, temperature: float = 1.0):
     logits = logits.float()
     p = torch.softmax(logits, dim=-1)
     q = torch.softmax(logits / temperature, dim=-1)
-
     ids_all: List[List[List[int]]] = []
     counts_all: List[List[List[int]]] = []
     bsz, seqlen, vocab = p.shape
-
     for b in range(bsz):
-        ids_seq: List[List[int]] = []
-        counts_seq: List[List[int]] = []
+        ids_seq, counts_seq = [], []
         for s in range(seqlen):
-            p_row = p[b, s]
-            q_row = q[b, s]
-            q_row = torch.nan_to_num(q_row, nan=0.0, posinf=0.0, neginf=0.0)
-            q_row = torch.clamp(q_row, min=0)
+            q_row = torch.nan_to_num(q[b, s], nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
             if not torch.isfinite(q_row).all() or q_row.sum() == 0:
                 q_row.fill_(1.0 / vocab)
             else:
-                q_row = q_row + 1e-6
-                q_row /= q_row.sum()
-            total_draws = num_samples * num_rounds
-            samples = torch.multinomial(q_row, total_draws, replacement=True)
+                q_row = (q_row + 1e-6) / q_row.sum()
+            samples = torch.multinomial(q_row, num_samples * num_rounds, replacement=True)
             uniq, counts = torch.unique(samples, return_counts=True)
             ids_seq.append(uniq.cpu().tolist())
             counts_seq.append(counts.cpu().tolist())
@@ -136,254 +112,165 @@ def sample_distribution(
     return ids_all, counts_all
 
 ################################################################################
-# Distributed weight‑streaming streamer                                          
+# Distributed weight‑streaming streamer                                         
 ################################################################################
 
 class DistributedStreamer:
-    """Streams model **layers** across devices, keeping activations resident.
-
-    Fix: pass correct *position_ids*, *cache_position*, and *rotary* position **embeddings** to every
-    transformer block (required by Qwen‑3).
-    """
+    """Weight‑streaming but params move **once per layer per full batch**."""
 
     def __init__(self, args: Args, device: torch.device, rank: int, world_size: int):
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
-
-        # Load model on CPU first
-        config = AutoConfig.from_pretrained(args.model_name)
-        config.attn_implementation = "eager"
+        self.rank, self.world_size, self.device = rank, world_size, device
+        cfg = AutoConfig.from_pretrained(args.model_name)
+        cfg.attn_implementation = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, config=config, device_map={"": "cpu"}, torch_dtype=torch.bfloat16
+            args.model_name, config=cfg, device_map={"": "cpu"}, torch_dtype=torch.bfloat16
         )
-        # Switch to flash after weights are in place
         self.model.config.attn_implementation = "flash_attention_2"
-
-        # Convenience handles
         self.layers = list(self.model.model.layers)
-        self.rotary_emb_fn = self.model.model.rotary_emb  # Qwen3 exposes helper
-        self.embed = self.model.model.embed_tokens.to(self.device)
-        self.lm_head = self.model.lm_head.to(self.device)
+        self.rotary_emb = self.model.model.rotary_emb
+        self.embed = self.model.model.embed_tokens.to(device)
+        self.lm_head = self.model.lm_head.to(device)
 
-    # ------------------------------------------------------------------
-    # utils
-    # ------------------------------------------------------------------
-    def _broadcast_module(self, module: torch.nn.Module, owner: int):
-        """Broadcast parameters & buffers from *owner* to all ranks asynchronously."""
+    # ---------------- internal helpers ----------------
+    def _broadcast(self, module: torch.nn.Module, owner: int):
         works: List[dist.Work] = []
         for t in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
             works.append(dist.broadcast(t.data, src=owner, async_op=True))
         for w in works:
             w.wait()
 
-    # ------------------------------------------------------------------
-    # forward & sample
-    # ------------------------------------------------------------------
+    # ---------------- public forward ------------------
     @torch.no_grad()
-    def sample(
-        self,
-        input_ids: torch.Tensor,
-        micro_batch_size: int,
-        num_samples: int,
-        num_rounds: int,
-        temperature: float = 1.0,
-    ):
-        """Compute logits and sample using weight‑streaming pipeline, now with correct rotary inputs."""
-        # Split into resident micro‑batches
-        batches = [input_ids[i : i + micro_batch_size] for i in range(0, input_ids.size(0), micro_batch_size)]
-
-        ids_all: List[List[List[int]]] = []
-        counts_all: List[List[List[int]]] = []
-
-        for micro in batches:
-            # Put tokens on GPU & embed once
-            hidden = self.embed(micro.to(self.device, non_blocking=True))
-
-            # ------------------------------------------------------------------
-            # Build position helpers **once** per sequence.
-            # ------------------------------------------------------------------
+    def sample(self, input_ids: torch.Tensor, micro_bs: int, num_samples: int, num_rounds: int, temperature: float):
+        # ---- split & embed once per micro‑batch ----
+        micro_inputs = [input_ids[i:i + micro_bs] for i in range(0, input_ids.size(0), micro_bs)]
+        micro_states = []
+        for mb in micro_inputs:
+            hidden = self.embed(mb.to(self.device, non_blocking=True))
             seq_len = hidden.size(1)
             cache_pos = torch.arange(seq_len, device=self.device)
-            position_ids = cache_pos.unsqueeze(0)  # (1, L)
-            pos_embeds = self.rotary_emb_fn(hidden, position_ids)  # cos/sin pair
+            pos_ids = cache_pos.unsqueeze(0)
+            pos_emb = self.rotary_emb(hidden, pos_ids)
+            micro_states.append({
+                "hidden": hidden,
+                "cache_pos": cache_pos,
+                "pos_ids": pos_ids,
+                "pos_emb": pos_emb,
+            })
 
-            # ------------------------------------------------------------------
-            # Stream every transformer block with proper positional args.
-            # ------------------------------------------------------------------
-            for idx, layer in enumerate(self.layers):
-                owner = idx % self.world_size
-                layer.to(self.device, non_blocking=True)
-                self._broadcast_module(layer, owner)
-
+        # ---- stream each transformer layer once ----
+        for idx, layer in enumerate(self.layers):
+            owner = idx % self.world_size
+            layer.to(self.device, non_blocking=True)
+            self._broadcast(layer, owner)
+            for ms in micro_states:
                 out = layer(
-                    hidden,
-                    position_ids=position_ids,
-                    cache_position=cache_pos,
-                    position_embeddings=pos_embeds,
+                    ms["hidden"],
+                    position_ids=ms["pos_ids"],
+                    cache_position=ms["cache_pos"],
+                    position_embeddings=ms["pos_emb"],
                     use_cache=False,
                 )
-                hidden = out[0] if isinstance(out, tuple) else out
+                ms["hidden"] = out[0] if isinstance(out, tuple) else out
+            layer.to("cpu", non_blocking=True)
+            torch.cuda.empty_cache()
 
-                layer.to("cpu", non_blocking=True)
-                torch.cuda.empty_cache()
-
-            # ------------------------------------------------------------------
-            # LM head & multinomial sampling
-            # ------------------------------------------------------------------
-            logits = self.lm_head(hidden)
-            ids, counts = sample_distribution(
-                logits, num_samples=num_samples, num_rounds=num_rounds, temperature=temperature
-            )
+        # ---- lm‑head & multinomial sampling ----
+        ids_all, counts_all = [], []
+        for ms in micro_states:
+            logits = self.lm_head(ms["hidden"])
+            ids, counts = sample_distribution(logits, num_samples, num_rounds, temperature)
             ids_all.extend(ids)
             counts_all.extend(counts)
-
         return ids_all, counts_all
 
 ################################################################################
-# Data utilities                                                                 
+# Data utilities                                                                
 ################################################################################
 
-def collate_fn(examples, tokenizer, max_seq_len: int):
-    texts = [e["text"] for e in examples]
-    return tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_seq_len,
-    )
+def collate_fn(exs, tok, max_len):
+    return tok([e["text"] for e in exs], return_tensors="pt", padding=True, truncation=True, max_length=max_len)
 
 
-def streaming_dataloader(
-    ds, tokenizer, batch_size: int, max_seq_len: int, rank: int, world_size: int, shutdown: threading.Event | None = None
-):
-    """Round‑robin sharding: example *i* goes to rank *i % world_size*."""
+def streaming_dataloader(ds, tok, bs, max_len, rank, world, shut: threading.Event | None):
     batch: List[dict] = []
-    for idx, example in enumerate(ds):
-        if shutdown and shutdown.is_set():
+    for i, ex in enumerate(ds):
+        if shut and shut.is_set():
             break
-        if idx % world_size != rank:
-            continue  # not my shard
-        batch.append(example)
-        if len(batch) == batch_size:
-            yield collate_fn(batch, tokenizer, max_seq_len)
+        if i % world != rank:
+            continue
+        batch.append(ex)
+        if len(batch) == bs:
+            yield collate_fn(batch, tok, max_len)
             batch.clear()
-            if shutdown and shutdown.is_set():
+            if shut and shut.is_set():
                 break
-    if batch and not (shutdown and shutdown.is_set()):
-        yield collate_fn(batch, tokenizer, max_seq_len)
+    if batch and not (shut and shut.is_set()):
+        yield collate_fn(batch, tok, max_len)
 
 ################################################################################
-# Push helper (rank 0 only)                                                      
+# Shard push (rank‑0)                                                           
 ################################################################################
 
-def push_shard_distributed(records_local: List[dict], args: Args, rank: int):
-    """Gather shards to rank 0 then push to the Hub to avoid write conflicts."""
-    world_size = dist.get_world_size()
-    gathered: List[List[dict]] | None = None
-    if rank == 0:
-        gathered = [None] * world_size  # type: ignore
-    dist.gather_object(records_local, gathered, dst=0)
-
-    if rank == 0 and gathered is not None:
-        combined: List[dict] = []
-        for rec_list in gathered:
-            combined.extend(rec_list)
-        if not combined:
-            return  # nothing to write
-
-        api = HfApi(token=args.hf_token)
-        files = api.list_repo_files(args.output_repo, repo_type="dataset")
-        idx = sum(f.endswith(".parquet") for f in files)
-        filename = f"data_{idx:05d}.parquet"
-        ds = Dataset.from_list(combined)
-        ds.to_parquet(filename)
-
-        repo = Repository(
-            local_dir="repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset"
-        )
-        repo.git_pull()
-        repo.git_add(filename)
-        repo.git_commit(f"Add shard {idx}")
-        repo.git_push()
-        repo.git_clear()
-        os.remove(filename)
+def push_shard(records_local: List[dict], args: Args, rank: int):
+    world = dist.get_world_size()
+    gather: List[List[dict]] | None = [None] * world if rank == 0 else None  # type: ignore
+    dist.gather_object(records_local, gather, dst=0)
+    if rank != 0:
+        return
+    combined: List[dict] = []
+    for part in gather:
+        combined.extend(part)
+    if not combined:
+        return
+    api = HfApi(token=args.hf_token)
+    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
+    fname = f"data_{idx:05d}.parquet"
+    Dataset.from_list(combined).to_parquet(fname)
+    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
+    repo.git_pull()
+    repo.git_add(fname)
+    repo.git_commit(f"Add shard {idx}")
+    repo.git_push()
+    repo.git_clear()
+    os.remove(fname)
 
 ################################################################################
-# Worker                                                                         
+# Worker                                                                       
 ################################################################################
 
 def worker(args: Args):
-    local_rank, rank, world_size, device = setup_distributed()
-
-    # Graceful shutdown handling – every rank listens.
+    local_rank, rank, world, device = setup_distributed()
     shutdown_evt = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: shutdown_evt.set())
 
-    def _handle_sigterm(signum, frame):
-        shutdown_evt.set()
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    streamer = DistributedStreamer(args, device, rank, world)
+    tok = AutoTokenizer.from_pretrained(args.model_name)
+    ds = load_dataset(args.dataset_name, split=args.dataset_split, token=args.hf_token, streaming=True)
+    loader = streaming_dataloader(ds, tok, args.batch_size, args.max_seq_len, rank, world, shutdown_evt)
 
-    streamer = DistributedStreamer(args, device, rank, world_size)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    dataset = load_dataset(
-        args.dataset_name,
-        split=args.dataset_split,
-        token=args.hf_token,
-        streaming=True,
-    )
-    dataloader = streaming_dataloader(
-        dataset, tokenizer, args.batch_size, args.max_seq_len, rank, world_size, shutdown_evt
-    )
-
-    pending_records: List[dict] = []
-    processed_total = 0
-
-    for batch in dataloader:
+    buf: List[dict] = []
+    seen = 0
+    for batch in loader:
         if shutdown_evt.is_set():
             break
-        input_ids = batch["input_ids"]
-        ids, counts = streamer.sample(
-            input_ids,
-            args.micro_batch_size,
-            args.num_samples,
-            args.num_rounds,
-            args.sampling_temperature,
-        )
-        for i in range(len(input_ids)):
-            tokens = input_ids[i].tolist()
+        ids, counts = streamer.sample(batch["input_ids"], args.micro_batch_size, args.num_samples, args.num_rounds, args.sampling_temperature)
+        for i, toks in enumerate(batch["input_ids"]):
+            tokens = toks.tolist()
             while tokens and tokens[-1] == 0:
                 tokens.pop()
-            seq_len = len(tokens)
-            record = {
-                "input_ids": tokens,
-                "sampled_ids": ids[i][:seq_len],
-                "sampled_counts": counts[i][:seq_len],
-            }
-            pending_records.append(record)
-        processed_total += len(input_ids)
-
-        if processed_total >= args.push_every:
-            push_shard_distributed(pending_records, args, rank)
-            pending_records.clear()
-            processed_total = 0
-
-        if shutdown_evt.is_set():
-            break
-
-    # Final flush
-    if pending_records and not shutdown_evt.is_set():
-        push_shard_distributed(pending_records, args, rank)
+            l = len(tokens)
+            buf.append({"input_ids": tokens, "sampled_ids": ids[i][:l], "sampled_counts": counts[i][:l]})
+        seen += len(batch["input_ids"])
+        if seen >= args.push_every:
+            push_shard(buf, args, rank)
+            buf.clear(); seen = 0
+    if buf and not shutdown_evt.is_set():
+        push_shard(buf, args, rank)
 
 ################################################################################
-# Main                                                                           
+# Entrypoint                                                                   
 ################################################################################
-
-def main():
-    args = parse_args()
-    worker(args)
-
 
 if __name__ == "__main__":
-    main()
+    worker(parse_args())
