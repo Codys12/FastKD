@@ -124,9 +124,14 @@ class Streamer:
             ]
 
             # embeddings -------------------------------------------------- #
-            embed_copies = torch.nn.parallel.replicate(
-                self.embed, self.devices[: len(hidden)]
-            )
+            devices = self.devices[: len(hidden)]
+            if len(devices) == 1 and devices[0].type == "cpu":
+                embed_copies = [self.embed]
+            else:
+                self.embed.to(devices[0])
+                embed_copies = torch.nn.parallel.replicate(
+                    self.embed, devices
+                )
             for i, emb in enumerate(embed_copies):
                 with torch.cuda.stream(self.streams[i]):
                     hidden[i] = emb(hidden[i])
@@ -146,9 +151,14 @@ class Streamer:
 
             # transformer layers ------------------------------------------ #
             for layer in self.layers:
-                layer_copies = torch.nn.parallel.replicate(
-                    layer, self.devices[: len(hidden)]
-                )
+                devices = self.devices[: len(hidden)]
+                if len(devices) == 1 and devices[0].type == "cpu":
+                    layer_copies = [layer]
+                else:
+                    layer.to(devices[0])
+                    layer_copies = torch.nn.parallel.replicate(
+                        layer, devices
+                    )
                 for i, l in enumerate(layer_copies):
                     with torch.cuda.stream(self.streams[i]):
                         out = l(
@@ -164,9 +174,14 @@ class Streamer:
                     l.to("cpu", non_blocking=True)
             
             # LM head ------------------------------------------------------ #
-            head_copies = torch.nn.parallel.replicate(
-                self.lm_head, self.devices[: len(hidden)]
-            )
+            devices = self.devices[: len(hidden)]
+            if len(devices) == 1 and devices[0].type == "cpu":
+                head_copies = [self.lm_head]
+            else:
+                self.lm_head.to(devices[0])
+                head_copies = torch.nn.parallel.replicate(
+                    self.lm_head, devices
+                )
             for i, head in enumerate(head_copies):
                 with torch.cuda.stream(self.streams[i]):
                     outs = [head(h.unsqueeze(0)) for h in hidden[i]]
