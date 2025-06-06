@@ -98,79 +98,8 @@ class Streamer:
         input_ids: torch.Tensor,
         micro_batch_size: int,
     ) -> torch.Tensor:
-        batches = [
-            input_ids[i : i + micro_batch_size]
-            for i in range(0, input_ids.size(0), micro_batch_size)
-        ]
-
-        results: List[torch.Tensor] = []
-        for start in range(0, len(batches), self.num_devices):
-            group = batches[start : start + self.num_devices]
-            hidden = [
-                mb.to(self.devices[i], non_blocking=True)
-                for i, mb in enumerate(group)
-            ]
-
-            # embedding layer
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                stream = self.streams[i]
-                with torch.cuda.stream(stream):
-                    self.embed.to(dev, non_blocking=True)
-                    hidden[i] = self.embed(hidden[i])
-                    self.embed.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-
-            # prepare position embeddings per micro batch
-            position_ids = []
-            cache_positions = []
-            pos_embeds = []
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                seq_len = hidden[i].size(1)
-                cache_pos = torch.arange(seq_len, device=dev)
-                pos_id = cache_pos.unsqueeze(0)
-                position_ids.append(pos_id)
-                cache_positions.append(cache_pos)
-                pos_embeds.append(self.model.model.rotary_emb(hidden[i], pos_id))
-
-            # transformer layers
-            for layer in self.layers:
-                for i, dev in enumerate(self.devices[: len(hidden)]):
-                    stream = self.streams[i]
-                    with torch.cuda.stream(stream):
-                        layer.to(dev, non_blocking=True)
-                        out = layer(
-                            hidden[i],
-                            position_ids=position_ids[i],
-                            cache_position=cache_positions[i],
-                            position_embeddings=pos_embeds[i],
-                        )
-                        hidden[i] = out[0] if isinstance(out, tuple) else out
-                        layer.to("cpu", non_blocking=True)
-                for s in self.streams[: len(hidden)]:
-                    s.synchronize()
-
-            # lm head with micro-batches of size 1
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                stream = self.streams[i]
-                with torch.cuda.stream(stream):
-                    self.lm_head.to(dev, non_blocking=True)
-                    outputs = []
-                    for mb in hidden[i].split(1, dim=0):
-                        out = self.lm_head(mb.to(dev, non_blocking=True))
-                        outputs.append(out)
-                    hidden[i] = torch.cat(outputs, dim=0)
-                    self.lm_head.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                hidden[i] = hidden[i].to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-            results.extend(hidden)
-
-        return torch.cat(results, dim=0)
+        #...
+        pass
 
     @torch.no_grad()
     def sample(
@@ -184,81 +113,22 @@ class Streamer:
         list[list[list[int]]],
         list[list[list[int]]],
     ]:
-        """Run the model in microbatches and sample logits on-device."""
-        batches = [
-            input_ids[i : i + micro_batch_size]
-            for i in range(0, input_ids.size(0), micro_batch_size)
-        ]
+        #...
 
-        ids_all: list[list[list[int]]] = []
-        counts_all: list[list[list[int]]] = []
+        # prepare position embeddings per micro batch
+        position_ids = []
+        cache_positions = []
+        pos_embeds = []
+        for i, dev in enumerate(self.devices[: len(hidden)]):
+            seq_len = hidden[i].size(1)
+            cache_pos = torch.arange(seq_len, device=dev)
+            pos_id = cache_pos.unsqueeze(0)
+            position_ids.append(pos_id)
+            cache_positions.append(cache_pos)
+            pos_embeds.append(self.model.model.rotary_emb(hidden[i], pos_id))
 
-        for start in range(0, len(batches), self.num_devices):
-            group = batches[start : start + self.num_devices]
-            hidden = [
-                mb.to(self.devices[i], non_blocking=True)
-                for i, mb in enumerate(group)
-            ]
-
-            # embedding layer
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                stream = self.streams[i]
-                with torch.cuda.stream(stream):
-                    self.embed.to(dev, non_blocking=True)
-                    hidden[i] = self.embed(hidden[i])
-                    self.embed.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-
-            # prepare position embeddings per micro batch
-            position_ids = []
-            cache_positions = []
-            pos_embeds = []
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                seq_len = hidden[i].size(1)
-                cache_pos = torch.arange(seq_len, device=dev)
-                pos_id = cache_pos.unsqueeze(0)
-                position_ids.append(pos_id)
-                cache_positions.append(cache_pos)
-                pos_embeds.append(self.model.model.rotary_emb(hidden[i], pos_id))
-
-            # transformer layers
-            for layer in self.layers:
-                for i, dev in enumerate(self.devices[: len(hidden)]):
-                    stream = self.streams[i]
-                    with torch.cuda.stream(stream):
-                        layer.to(dev, non_blocking=True)
-                        out = layer(
-                            hidden[i],
-                            position_ids=position_ids[i],
-                            cache_position=cache_positions[i],
-                            position_embeddings=pos_embeds[i],
-                        )
-                        hidden[i] = out[0] if isinstance(out, tuple) else out
-                        layer.to("cpu", non_blocking=True)
-                for s in self.streams[: len(hidden)]:
-                    s.synchronize()
-
-            # lm head and sampling with micro batches of size 1
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                stream = self.streams[i]
-                with torch.cuda.stream(stream):
-                    self.lm_head.to(dev, non_blocking=True)
-                    for mb in hidden[i].split(1, dim=0):
-                        logits = self.lm_head(mb.to(dev, non_blocking=True))
-                        ids, counts = sample_distribution(
-                            logits,
-                            num_samples=num_samples,
-                            num_rounds=num_rounds,
-                            temperature=temperature,
-                        )
-                        ids_all.extend(ids)
-                        counts_all.extend(counts)
-                    self.lm_head.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-
-        return ids_all, counts_all
+        #...
+        pass
 
 
 def sample_distribution(
