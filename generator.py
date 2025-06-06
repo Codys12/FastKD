@@ -132,9 +132,13 @@ class Streamer:
 
             # transformer layers ------------------------------------------ #
             for layer in self.layers:
+                # move to the first device once
+                layer.to(self.devices[0], non_blocking=True)
                 for i, dev in enumerate(self.devices[: len(hidden)]):
                     with torch.cuda.stream(self.streams[i]):
-                        layer.to(dev, non_blocking=True)
+                        if i > 0:
+                            # move directly from the previous GPU
+                            layer.to(dev, non_blocking=True)
                         out = layer(
                             hidden[i],
                             position_ids=position_ids[i],
@@ -142,16 +146,21 @@ class Streamer:
                             position_embeddings=rot_embeds[i],
                         )
                         hidden[i] = out[0] if isinstance(out, tuple) else out
-                        layer.to("cpu", non_blocking=True)
                 for s in self.streams[: len(hidden)]:
                     s.synchronize()
-
+                layer.to("cpu", non_blocking=True)
+            
             # LM head ------------------------------------------------------ #
+            self.lm_head.to(self.devices[0], non_blocking=True)
             for i, dev in enumerate(self.devices[: len(hidden)]):
                 with torch.cuda.stream(self.streams[i]):
-                    self.lm_head.to(dev, non_blocking=True)
-                    hidden[i] = self.lm_head(hidden[i])
-                    self.lm_head.to("cpu", non_blocking=True)
+                    if i > 0:
+                        self.lm_head.to(dev, non_blocking=True)
+                    outs = [self.lm_head(h.unsqueeze(0)) for h in hidden[i]]
+                    hidden[i] = torch.cat(outs, dim=0)
+            for s in self.streams[: len(hidden)]:
+                s.synchronize()
+            self.lm_head.to("cpu", non_blocking=True)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
 
