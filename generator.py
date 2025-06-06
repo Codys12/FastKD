@@ -124,21 +124,16 @@ class Streamer:
             ]
 
             # embeddings -------------------------------------------------- #
-            with torch.cuda.stream(copy_streams[0]):
-                self.embed.to(self.devices[0], non_blocking=True)
-            for i in range(1, len(hidden)):
-                with torch.cuda.stream(copy_streams[i]):
-                    copy_streams[i].wait_stream(copy_streams[i - 1])
-                    self.embed.to(self.devices[i], non_blocking=True)
-            events = [torch.cuda.Event() for _ in range(len(hidden))]
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                copy_streams[i].record_event(events[i])
+            embed_copies = torch.nn.parallel.replicate(
+                self.embed, self.devices[: len(hidden)]
+            )
+            for i, emb in enumerate(embed_copies):
                 with torch.cuda.stream(self.streams[i]):
-                    self.streams[i].wait_event(events[i])
-                    hidden[i] = self.embed(hidden[i])
+                    hidden[i] = emb(hidden[i])
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
-            self.embed.to("cpu", non_blocking=True)
+            for emb in embed_copies:
+                emb.to("cpu", non_blocking=True)
 
             # rotary embeddings/position ids ------------------------------ #
             position_ids, cache_positions, rot_embeds = [], [], []
@@ -151,18 +146,12 @@ class Streamer:
 
             # transformer layers ------------------------------------------ #
             for layer in self.layers:
-                with torch.cuda.stream(copy_streams[0]):
-                    layer.to(self.devices[0], non_blocking=True)
-                for i in range(1, len(hidden)):
-                    with torch.cuda.stream(copy_streams[i]):
-                        copy_streams[i].wait_stream(copy_streams[i - 1])
-                        layer.to(self.devices[i], non_blocking=True)
-                events = [torch.cuda.Event() for _ in range(len(hidden))]
-                for i, dev in enumerate(self.devices[: len(hidden)]):
-                    copy_streams[i].record_event(events[i])
+                layer_copies = torch.nn.parallel.replicate(
+                    layer, self.devices[: len(hidden)]
+                )
+                for i, l in enumerate(layer_copies):
                     with torch.cuda.stream(self.streams[i]):
-                        self.streams[i].wait_event(events[i])
-                        out = layer(
+                        out = l(
                             hidden[i],
                             position_ids=position_ids[i],
                             cache_position=cache_positions[i],
@@ -171,25 +160,21 @@ class Streamer:
                         hidden[i] = out[0] if isinstance(out, tuple) else out
                 for s in self.streams[: len(hidden)]:
                     s.synchronize()
-                layer.to("cpu", non_blocking=True)
+                for l in layer_copies:
+                    l.to("cpu", non_blocking=True)
             
             # LM head ------------------------------------------------------ #
-            with torch.cuda.stream(copy_streams[0]):
-                self.lm_head.to(self.devices[0], non_blocking=True)
-            for i in range(1, len(hidden)):
-                with torch.cuda.stream(copy_streams[i]):
-                    copy_streams[i].wait_stream(copy_streams[i - 1])
-                    self.lm_head.to(self.devices[i], non_blocking=True)
-            events = [torch.cuda.Event() for _ in range(len(hidden))]
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                copy_streams[i].record_event(events[i])
+            head_copies = torch.nn.parallel.replicate(
+                self.lm_head, self.devices[: len(hidden)]
+            )
+            for i, head in enumerate(head_copies):
                 with torch.cuda.stream(self.streams[i]):
-                    self.streams[i].wait_event(events[i])
-                    outs = [self.lm_head(h.unsqueeze(0)) for h in hidden[i]]
+                    outs = [head(h.unsqueeze(0)) for h in hidden[i]]
                     hidden[i] = torch.cat(outs, dim=0)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
-            self.lm_head.to("cpu", non_blocking=True)
+            for head in head_copies:
+                head.to("cpu", non_blocking=True)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
 
