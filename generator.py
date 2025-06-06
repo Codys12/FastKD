@@ -83,6 +83,13 @@ class Streamer:
             torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())
         ] or [torch.device("cpu")]
         self.num_devices = len(self.devices)
+        self.layer_devices = [self.devices[i % self.num_devices] for i in range(len(self.layers))]
+
+        for layer, dev in zip(self.layers, self.layer_devices):
+            layer.to(dev)
+        self.embed.to(self.devices[0])
+        self.lm_head.to("cpu")
+
         self.streams = (
             [torch.cuda.Stream(device=d) for d in self.devices]
             if torch.cuda.device_count() > 0
@@ -105,62 +112,33 @@ class Streamer:
         ]
 
         results: List[torch.Tensor] = []
-        for start in range(0, len(batches), self.num_devices):
-            group = batches[start : start + self.num_devices]
-            hidden = [
-                mb.to(self.devices[i], non_blocking=True)
-                for i, mb in enumerate(group)
-            ]
+        for mb in batches:
+            hidden = mb.to(self.devices[0], non_blocking=True)
+            hidden = self.embed(hidden)
 
-            # embeddings -------------------------------------------------- #
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                with torch.cuda.stream(self.streams[i]):
-                    self.embed.to(dev, non_blocking=True)
-                    hidden[i] = self.embed(hidden[i])
-                    self.embed.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
+            seq_len = hidden.size(1)
+            position = torch.arange(seq_len, device=hidden.device)
+            pos_ids = position.unsqueeze(0)
 
-            # rotary embeddings/position ids ------------------------------ #
-            position_ids, cache_positions, rot_embeds = [], [], []
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                seq_len = hidden[i].size(1)
-                cache_pos = torch.arange(seq_len, device=dev)
-                position_ids.append(cache_pos.unsqueeze(0))
-                cache_positions.append(cache_pos)
-                rot_embeds.append(self.model.model.rotary_emb(hidden[i], position_ids[-1]))
+            for layer, dev in zip(self.layers, self.layer_devices):
+                if hidden.device != dev:
+                    hidden = hidden.to(dev, non_blocking=True)
+                    pos_ids = pos_ids.to(dev, non_blocking=True)
+                    position = position.to(dev, non_blocking=True)
+                rot = self.model.model.rotary_emb(hidden, pos_ids)
+                out = layer(
+                    hidden,
+                    position_ids=pos_ids,
+                    cache_position=position,
+                    position_embeddings=rot,
+                )
+                hidden = out[0] if isinstance(out, tuple) else out
 
-            # transformer layers ------------------------------------------ #
-            for layer in self.layers:
-                for i, dev in enumerate(self.devices[: len(hidden)]):
-                    with torch.cuda.stream(self.streams[i]):
-                        layer.to(dev, non_blocking=True)
-                        out = layer(
-                            hidden[i],
-                            position_ids=position_ids[i],
-                            cache_position=cache_positions[i],
-                            position_embeddings=rot_embeds[i],
-                        )
-                        hidden[i] = out[0] if isinstance(out, tuple) else out
-                        layer.to("cpu", non_blocking=True)
-                for s in self.streams[: len(hidden)]:
-                    s.synchronize()
-
-            # LM head ------------------------------------------------------ #
-            for i, dev in enumerate(self.devices[: len(hidden)]):
-                with torch.cuda.stream(self.streams[i]):
-                    self.lm_head.to(dev, non_blocking=True)
-                    hidden[i] = self.lm_head(hidden[i])
-                    self.lm_head.to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-
-            # back to CPU -------------------------------------------------- #
-            for i in range(len(hidden)):
-                hidden[i] = hidden[i].to("cpu", non_blocking=True)
-            for s in self.streams[: len(hidden)]:
-                s.synchronize()
-            results.extend(hidden)
+            hidden = hidden.to("cpu", non_blocking=True)
+            logits_mb = []
+            for i in range(hidden.size(0)):
+                logits_mb.append(self.lm_head(hidden[i : i + 1]))
+            results.append(torch.cat(logits_mb, dim=0))
 
         return torch.cat(results, dim=0)
 
