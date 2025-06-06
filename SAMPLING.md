@@ -30,12 +30,12 @@ The goal is to approximate the full softmax distribution of the teacher model wh
 
 4. **Store Results**
     - For every position `s` in every sequence `b`, store two parallel lists:
-      - `sampled_ids[b][s]` – the token ids that were sampled.
-      - `sampled_probs[b][s]` – the normalized probability of each corresponding id.
-      - `sampled_logprobs[b][s]` – the logarithm of each normalized probability.
+        - `sampled_ids[b][s]` – the token ids that were sampled.
+        - `sampled_counts[b][s]` – how many times each token was drawn.
+    - The normalized probabilities can be reconstructed from these counts.
     - The number of unique tokens grows sub‑linearly with the number of rounds.  Fifty rounds typically yield around twelve unique tokens per position.
 
-The function `sample_distribution` in `generator.py` implements the process above and returns the `sampled_ids`, `sampled_probs` and `sampled_logprobs` structures. These results can then be serialized and used for knowledge distillation.
+The function `sample_distribution` in `generator.py` implements the process above and returns the `sampled_ids` and `sampled_counts` structures. These results can then be serialized and used for knowledge distillation.
 
 ## Example
 
