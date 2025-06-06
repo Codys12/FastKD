@@ -193,12 +193,15 @@ class DistributedStreamer:
             if shutdown_evt.is_set():
                 break
 
-        # lm_head & sampling
+        # ---- lm_head & sampling with **seq‑at‑a‑time** to cap memory ----
         ids_all, cnts_all = [], []
         for s in states:
-            logits = self.lm_head(s["hidden"])
-            i, c = sample_distribution(logits, N, R, temp)
-            ids_all.extend(i); cnts_all.extend(c)
+            # Guarantee micro‑batch of 1 for logits to avoid OOM
+            for seq_hidden in s["hidden"].split(1, dim=0):
+                logits = self.lm_head(seq_hidden)
+                i, c = sample_distribution(logits, N, R, temp)
+                ids_all.extend(i)
+                cnts_all.extend(c)
         return ids_all, cnts_all
 
 # ---------------------------------------------------------------------------
