@@ -89,6 +89,16 @@ class Streamer:
             else [torch.cuda.current_stream()]
         )
 
+    def _broadcast_module(self, module: torch.nn.Module) -> None:
+        """Broadcast module parameters from device 0 to all other devices asynchronously."""
+        if self.num_devices <= 1:
+            return
+        tensors = [p.data for p in module.parameters()] + [b.data for b in module.buffers()]
+        work = torch.cuda.comm.broadcast_coalesced(tensors, self.devices, async_op=True)
+        # wait for the broadcast to complete before using the parameters
+        if hasattr(work, "wait"):
+            work.wait()
+
     # --------------------------------------------------------------------- #
     #                  Forward pass used by `sample()`                      #
     # --------------------------------------------------------------------- #
@@ -105,6 +115,7 @@ class Streamer:
         ]
 
         results: List[torch.Tensor] = []
+        copy_streams = [torch.cuda.Stream(device=d) for d in self.devices]
         for start in range(0, len(batches), self.num_devices):
             group = batches[start : start + self.num_devices]
             hidden = [
@@ -113,13 +124,21 @@ class Streamer:
             ]
 
             # embeddings -------------------------------------------------- #
+            with torch.cuda.stream(copy_streams[0]):
+                self.embed.to(self.devices[0], non_blocking=True)
+            for i in range(1, len(hidden)):
+                with torch.cuda.stream(copy_streams[i]):
+                    copy_streams[i].wait_stream(copy_streams[i - 1])
+                    self.embed.to(self.devices[i], non_blocking=True)
+            events = [torch.cuda.Event() for _ in range(len(hidden))]
             for i, dev in enumerate(self.devices[: len(hidden)]):
+                copy_streams[i].record_event(events[i])
                 with torch.cuda.stream(self.streams[i]):
-                    self.embed.to(dev, non_blocking=True)
+                    self.streams[i].wait_event(events[i])
                     hidden[i] = self.embed(hidden[i])
-                    self.embed.to("cpu", non_blocking=True)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
+            self.embed.to("cpu", non_blocking=True)
 
             # rotary embeddings/position ids ------------------------------ #
             position_ids, cache_positions, rot_embeds = [], [], []
@@ -132,13 +151,17 @@ class Streamer:
 
             # transformer layers ------------------------------------------ #
             for layer in self.layers:
-                # move to the first device once
-                layer.to(self.devices[0], non_blocking=True)
+                with torch.cuda.stream(copy_streams[0]):
+                    layer.to(self.devices[0], non_blocking=True)
+                for i in range(1, len(hidden)):
+                    with torch.cuda.stream(copy_streams[i]):
+                        copy_streams[i].wait_stream(copy_streams[i - 1])
+                        layer.to(self.devices[i], non_blocking=True)
+                events = [torch.cuda.Event() for _ in range(len(hidden))]
                 for i, dev in enumerate(self.devices[: len(hidden)]):
+                    copy_streams[i].record_event(events[i])
                     with torch.cuda.stream(self.streams[i]):
-                        if i > 0:
-                            # move directly from the previous GPU
-                            layer.to(dev, non_blocking=True)
+                        self.streams[i].wait_event(events[i])
                         out = layer(
                             hidden[i],
                             position_ids=position_ids[i],
@@ -151,11 +174,17 @@ class Streamer:
                 layer.to("cpu", non_blocking=True)
             
             # LM head ------------------------------------------------------ #
-            self.lm_head.to(self.devices[0], non_blocking=True)
+            with torch.cuda.stream(copy_streams[0]):
+                self.lm_head.to(self.devices[0], non_blocking=True)
+            for i in range(1, len(hidden)):
+                with torch.cuda.stream(copy_streams[i]):
+                    copy_streams[i].wait_stream(copy_streams[i - 1])
+                    self.lm_head.to(self.devices[i], non_blocking=True)
+            events = [torch.cuda.Event() for _ in range(len(hidden))]
             for i, dev in enumerate(self.devices[: len(hidden)]):
+                copy_streams[i].record_event(events[i])
                 with torch.cuda.stream(self.streams[i]):
-                    if i > 0:
-                        self.lm_head.to(dev, non_blocking=True)
+                    self.streams[i].wait_event(events[i])
                     outs = [self.lm_head(h.unsqueeze(0)) for h in hidden[i]]
                     hidden[i] = torch.cat(outs, dim=0)
             for s in self.streams[: len(hidden)]:
