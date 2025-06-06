@@ -129,44 +129,110 @@ def sample_distribution(logits: torch.Tensor, num_samples: int, num_rounds: int,
 ################################################################################
 
 class DistributedStreamer:
+    """Streams layers with **double‑buffer prefetch** so the next block’s weights
+    are broadcast while the current block is computing.  Keeps only two blocks
+    resident at once and overlaps comm/compute to reduce stalls.
+    """
     def __init__(self, args: Args, device: torch.device, rank: int, world: int):
         self.rank, self.world, self.device = rank, world, device
         cfg = AutoConfig.from_pretrained(args.model_name); cfg.attn_implementation = "eager"
-        self.model = AutoModelForCausalLM.from_pretrained(args.model_name, config=cfg, device_map={"": "cpu"}, torch_dtype=torch.bfloat16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            config=cfg,
+            device_map={"": "cpu"},  # start on CPU (weight‑streaming)
+            torch_dtype=torch.bfloat16,
+        )
         self.model.config.attn_implementation = "flash_attention_2"
         self.layers = list(self.model.model.layers)
         self.rotary_emb = self.model.model.rotary_emb
         self.embed = self.model.model.embed_tokens.to(device)
         self.lm_head = self.model.lm_head.to(device)
 
-    def _broadcast(self, mod: torch.nn.Module, owner: int):
-        ws = [dist.broadcast(p.data, src=owner, async_op=True) for p in list(mod.parameters()) + list(mod.buffers())]
-        for w in ws: w.wait()
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _async_broadcast(self, module: torch.nn.Module, owner: int):
+        """Return a list of async broadcast handles for *module*."""
+        handles = []
+        for t in list(module.parameters()) + list(module.buffers()):
+            handles.append(dist.broadcast(t.data, src=owner, async_op=True))
+        return handles
 
+    # ------------------------------------------------------------------
+    # forward & sample
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def sample(self, ids: torch.Tensor, micro_bs: int, num_samples: int, num_rounds: int, temp: float):
+        # 1. Prepare resident micro‑batches (on‑device) --------------------------------
         micro_inputs = [ids[i : i + micro_bs] for i in range(0, ids.size(0), micro_bs)]
         micro_states = []
         for mb in micro_inputs:
             h = self.embed(mb.to(self.device, non_blocking=True))
-            L = h.size(1); cache_pos = torch.arange(L, device=self.device); pos_ids = cache_pos.unsqueeze(0)
+            L = h.size(1)
+            cache_pos = torch.arange(L, device=self.device)
+            pos_ids = cache_pos.unsqueeze(0)
             pos_emb = self.rotary_emb(h, pos_ids)
             micro_states.append({"hidden": h, "cache_pos": cache_pos, "pos_ids": pos_ids, "pos_emb": pos_emb})
 
-        for i, layer in enumerate(self.layers):
-            owner = i % self.world
-            layer.to(self.device, non_blocking=True); self._broadcast(layer, owner)
-            for ms in micro_states:
-                out = layer(ms["hidden"], position_ids=ms["pos_ids"], cache_position=ms["cache_pos"], position_embeddings=ms["pos_emb"], use_cache=False)
-                ms["hidden"] = out[0] if isinstance(out, tuple) else out
-            layer.to("cpu", non_blocking=True); torch.cuda.empty_cache()
-            if shutdown_evt.is_set(): break
+        # 2. Double‑buffered layer stream ----------------------------------------------
+        prefetch_handles = []  # async handles for the *next* layer
 
+        # Prefetch layer‑0 synchronously to kick things off
+        first_layer = self.layers[0]
+        owner0 = 0 % self.world
+        if self.rank == owner0:
+            first_layer.to(self.device, non_blocking=True)
+        self._async_broadcast(first_layer, owner0)  # wait immediately so weights are ready
+        for h in prefetch_handles: h.wait()
+        prefetch_handles = []
+
+        for idx, layer in enumerate(self.layers):
+            owner = idx % self.world
+
+            # Ensure any previous prefetch finished (for idx>0)
+            if prefetch_handles:
+                for h in prefetch_handles:
+                    h.wait()
+                prefetch_handles = []
+
+            # If this rank wasn't owner, weights may still be on CPU -> broadcast already
+            if layer.weight.device != self.device:
+                layer.to(self.device, non_blocking=True)
+
+            # ---- compute current layer over all micro‑batches ----
+            for ms in micro_states:
+                out = layer(
+                    ms["hidden"],
+                    position_ids=ms["pos_ids"],
+                    cache_position=ms["cache_pos"],
+                    position_embeddings=ms["pos_emb"],
+                    use_cache=False,
+                )
+                ms["hidden"] = out[0] if isinstance(out, tuple) else out
+
+            # ---- launch prefetch of *next* layer (if any) while we free this one ----
+            next_idx = idx + 1
+            if next_idx < len(self.layers):
+                next_layer = self.layers[next_idx]
+                next_owner = next_idx % self.world
+                if self.rank == next_owner:
+                    next_layer.to(self.device, non_blocking=True)
+                prefetch_handles = self._async_broadcast(next_layer, next_owner)
+
+            # Free current layer weights to keep at most 2 layers resident
+            layer.to("cpu", non_blocking=True)
+            torch.cuda.empty_cache()
+
+            if shutdown_evt.is_set():
+                break
+
+        # 3. lm_head once per micro‑batch → vectorised sampling ------------------------
         ids_all, cnts_all = [], []
         for ms in micro_states:
             logits = self.lm_head(ms["hidden"])
             i, c = sample_distribution(logits, num_samples, num_rounds, temp)
             ids_all.extend(i); cnts_all.extend(c)
+
         return ids_all, cnts_all
 
 ################################################################################
