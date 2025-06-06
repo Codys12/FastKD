@@ -9,6 +9,9 @@ from typing import List
 import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from huggingface_hub import HfApi, Repository
+import multiprocessing as mp
+import os
 
 
 STREAMER: "Streamer" | None = None
@@ -148,12 +151,16 @@ class Streamer:
                 for s in self.streams[: len(hidden)]:
                     s.synchronize()
 
-            # lm head
+            # lm head with micro-batches of size 1
             for i, dev in enumerate(self.devices[: len(hidden)]):
                 stream = self.streams[i]
                 with torch.cuda.stream(stream):
                     self.lm_head.to(dev, non_blocking=True)
-                    hidden[i] = self.lm_head(hidden[i])
+                    outputs = []
+                    for mb in hidden[i].split(1, dim=0):
+                        out = self.lm_head(mb.to(dev, non_blocking=True))
+                        outputs.append(out)
+                    hidden[i] = torch.cat(outputs, dim=0)
                     self.lm_head.to("cpu", non_blocking=True)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
@@ -176,8 +183,7 @@ class Streamer:
         temperature: float = 1.0,
     ) -> tuple[
         list[list[list[int]]],
-        list[list[list[float]]],
-        list[list[list[float]]],
+        list[list[list[int]]],
     ]:
         """Run the model in microbatches and sample logits on-device."""
         batches = [
@@ -186,8 +192,7 @@ class Streamer:
         ]
 
         ids_all: list[list[list[int]]] = []
-        probs_all: list[list[list[float]]] = []
-        logprobs_all: list[list[list[float]]] = []
+        counts_all: list[list[list[int]]] = []
 
         for start in range(0, len(batches), self.num_devices):
             group = batches[start : start + self.num_devices]
@@ -235,29 +240,26 @@ class Streamer:
                 for s in self.streams[: len(hidden)]:
                     s.synchronize()
 
-            # lm head
+            # lm head and sampling with micro batches of size 1
             for i, dev in enumerate(self.devices[: len(hidden)]):
                 stream = self.streams[i]
                 with torch.cuda.stream(stream):
                     self.lm_head.to(dev, non_blocking=True)
-                    hidden[i] = self.lm_head(hidden[i])
+                    for mb in hidden[i].split(1, dim=0):
+                        logits = self.lm_head(mb.to(dev, non_blocking=True))
+                        ids, counts = sample_distribution(
+                            logits,
+                            num_samples=num_samples,
+                            num_rounds=num_rounds,
+                            temperature=temperature,
+                        )
+                        ids_all.extend(ids)
+                        counts_all.extend(counts)
                     self.lm_head.to("cpu", non_blocking=True)
             for s in self.streams[: len(hidden)]:
                 s.synchronize()
 
-            # sample logits on-device and move results to CPU
-            for h in hidden:
-                ids, probs, log_probs = sample_distribution(
-                    h,
-                    num_samples=num_samples,
-                    num_rounds=num_rounds,
-                    temperature=temperature,
-                )
-                ids_all.extend(ids)
-                probs_all.extend(probs)
-                logprobs_all.extend(log_probs)
-
-        return ids_all, probs_all, logprobs_all
+        return ids_all, counts_all
 
 
 def sample_distribution(
@@ -267,33 +269,20 @@ def sample_distribution(
     temperature: float = 1.0,
 ) -> tuple[
     list[list[list[int]]],
-    list[list[list[float]]],
-    list[list[list[float]]],
+    list[list[list[int]]],
 ]:
-    """
-    Importance-sample `num_samples` tokens per round from proposal q(x)
-    for `num_rounds` rounds, following the paper.  Probabilities are
-    accumulated across rounds and renormalized for each token position.
-
-    Returns:
-        ids_all        – sampled token IDs          (B × S × M)
-        probs_all      – normalized weights         (B × S × M)
-        log_probs_all  – log of normalized weights  (B × S × M)
-    """
+    """Return sampled token ids and raw counts for each position."""
     logits = logits.float()
     p = torch.softmax(logits, dim=-1)
     q = torch.softmax(logits / temperature, dim=-1)
 
     ids_all: List[List[List[int]]] = []
-    probs_all: List[List[List[float]]] = []
-    log_probs_all: List[List[List[float]]] = []
+    counts_all: List[List[List[int]]] = []
     bsz, seqlen, vocab = p.shape
-    eps = 1e-12
 
     for b in range(bsz):
         ids_seq: List[List[int]] = []
-        probs_seq: List[List[float]] = []
-        logprobs_seq: List[List[float]] = []
+        counts_seq: List[List[int]] = []
 
         for s in range(seqlen):
             p_row = p[b, s]
@@ -305,47 +294,21 @@ def sample_distribution(
             if not torch.isfinite(q_row).all() or q_row.sum() == 0:
                 q_row.fill_(1.0 / vocab)
             else:
-                q_row = q_row + 1e-6  # avoid exact zeros
+                q_row = q_row + 1e-6
                 q_row /= q_row.sum()
 
-            # sample N × R tokens in one shot (identical to R rounds of size N)
             total_draws = num_samples * num_rounds
             samples = torch.multinomial(q_row, total_draws, replacement=True)
 
             uniq, counts = torch.unique(samples, return_counts=True)
 
-            # log-weight: log(m_i · p_i / q_i)
-            log_weights = (
-                counts.float().log()
-                + torch.log(p_row[uniq])
-                - torch.log(q_row[uniq])
-            )
-            log_weights = torch.nan_to_num(log_weights, nan=-float("inf"))
-
-            # normalize weights in log-space for stability
-            m = log_weights.max()
-            weights = torch.exp(log_weights - m)
-            weight_sum = weights.sum()
-
-            if not torch.isfinite(weight_sum) or weight_sum <= 0:
-                probs_norm = torch.full_like(weights, 1.0 / weights.numel())
-                log_probs_norm = torch.log(probs_norm)
-            else:
-                probs_norm = weights / weight_sum
-                log_probs_norm = log_weights - m - torch.log(weight_sum)
-
-            # remove zero-probability tokens
-            keep = probs_norm > 0
-
-            ids_seq.append(uniq[keep].cpu().tolist())
-            probs_seq.append(probs_norm[keep].cpu().tolist())
-            logprobs_seq.append(log_probs_norm[keep].cpu().tolist())
+            ids_seq.append(uniq.cpu().tolist())
+            counts_seq.append(counts.cpu().tolist())
 
         ids_all.append(ids_seq)
-        probs_all.append(probs_seq)
-        log_probs_all.append(logprobs_seq)
+        counts_all.append(counts_seq)
 
-    return ids_all, probs_all, log_probs_all
+    return ids_all, counts_all
 
 
 def collate_fn(examples, tokenizer, max_seq_len: int):
@@ -376,8 +339,29 @@ def streaming_dataloader(
         yield collate_fn(batch, tokenizer, max_seq_len)
 
 
-def main():
-    args = parse_args()
+def push_shard(records: List[dict], args: Args) -> None:
+    """Append a dataset shard to the Hub repository."""
+    api = HfApi(token=args.hf_token)
+    files = api.list_repo_files(args.output_repo, repo_type="dataset")
+    idx = sum(f.endswith(".parquet") for f in files)
+
+    filename = f"data_{idx:05d}.parquet"
+    ds = Dataset.from_list(records)
+    ds.to_parquet(filename)
+
+    repo = Repository(
+        local_dir="repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset"
+    )
+    repo.git_pull()
+    repo.git_add(filename)
+    repo.git_commit(f"Add shard {idx}")
+    repo.git_push()
+    repo.git_clear()
+    os.remove(filename)
+
+
+def worker(rank: int, args: Args) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
 
     global STREAMER, SHUTDOWN
     SHUTDOWN = threading.Event()
@@ -407,7 +391,7 @@ def main():
         if SHUTDOWN.is_set():
             break
         input_ids = batch["input_ids"]
-        ids, probs, log_probs = STREAMER.sample(
+        ids, counts = STREAMER.sample(
             input_ids,
             args.micro_batch_size,
             args.num_samples,
@@ -415,7 +399,6 @@ def main():
             args.sampling_temperature,
         )
         for i in range(len(input_ids)):
-            # remove trailing padding tokens from the input sequence
             tokens = input_ids[i].tolist()
             while tokens and tokens[-1] == 0:
                 tokens.pop()
@@ -425,22 +408,35 @@ def main():
             record = {
                 "input_ids": tokens,
                 "sampled_ids": ids[i][:seq_len],
-                "sampled_probs": probs[i][:seq_len],
-                "sampled_logprobs": log_probs[i][:seq_len],
+                "sampled_counts": counts[i][:seq_len],
             }
             all_records.append(record)
         total += len(input_ids)
         if total >= args.push_every:
-            print("Example sampled_probs:", all_records[0]["sampled_probs"])
-            ds = Dataset.from_list(all_records)
-            ds.push_to_hub(args.output_repo, token=args.hf_token)
+            print("Example sampled_counts:", all_records[0]["sampled_counts"])
+            push_shard(all_records, args)
             all_records.clear()
             total = 0
         if SHUTDOWN.is_set():
             break
     if all_records and not SHUTDOWN.is_set():
-        ds = Dataset.from_list(all_records)
-        ds.push_to_hub(args.output_repo, token=args.hf_token)
+        push_shard(all_records, args)
+
+def main():
+    args = parse_args()
+
+    num_devices = torch.cuda.device_count() or 1
+
+    if num_devices > 1:
+        procs = []
+        for rank in range(num_devices):
+            p = mp.Process(target=worker, args=(rank, args))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+    else:
+        worker(0, args)
 
 
 if __name__ == "__main__":
