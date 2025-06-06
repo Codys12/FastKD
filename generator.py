@@ -20,7 +20,7 @@ within the grace period, and the node never goes to the *drained* state.
 """
 from __future__ import annotations
 
-import argparse, atexit, os, signal, sys, threading, time
+import argparse, atexit, os, signal, sys, threading, time, datetime
 from dataclasses import dataclass
 from typing import List
 
@@ -36,15 +36,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 shutdown_evt = threading.Event()
 
 def _signal_handler(sig, frame):
-    print(f"[rank ?] caught signal {sig}")
+    """Simple handler: mark shutdown event; let main loop exit cleanly."""
     shutdown_evt.set()
-    # set CUDA flag so other ranks notice (works even if they’re stuck in C++)
-    if dist.is_initialized():
-        try:
-            flag = torch.tensor([1], device=torch.device("cuda"))  # small 1‑int tensor
-            dist.broadcast(flag, src=dist.get_rank())
-        except Exception:
-            pass  # ok – maybe not initialised yet
 
 for _s in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
     signal.signal(_s, _signal_handler)
@@ -89,7 +82,7 @@ def parse_args() -> Args:
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
     if not dist.is_initialized():
-        dist.init_process_group("nccl", timeout=torch.timedelta(seconds=900))
+        dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=900))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
