@@ -10,7 +10,6 @@ import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from huggingface_hub import HfApi, Repository
-import multiprocessing as mp
 import os
 
 
@@ -360,8 +359,7 @@ def push_shard(records: List[dict], args: Args) -> None:
     os.remove(filename)
 
 
-def worker(rank: int, args: Args) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+def worker(args: Args) -> None:
 
     global STREAMER, SHUTDOWN
     SHUTDOWN = threading.Event()
@@ -424,19 +422,7 @@ def worker(rank: int, args: Args) -> None:
 
 def main():
     args = parse_args()
-
-    num_devices = torch.cuda.device_count() or 1
-
-    if num_devices > 1:
-        procs = []
-        for rank in range(num_devices):
-            p = mp.Process(target=worker, args=(rank, args))
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-    else:
-        worker(0, args)
+    worker(args)
 
 
 if __name__ == "__main__":
