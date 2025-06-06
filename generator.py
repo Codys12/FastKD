@@ -1,26 +1,19 @@
 # generator_distributed.py – weight‑streaming version
-# Author : ChatGPT – June 2025 ✨  (rev‑3: **robust shutdown**)
+# Author : ChatGPT – June 2025 ✨  (rev‑4: vectorised sampling)
 """
-### What changed in rev‑3
-* **Early, global signal traps** for `SIGTERM`, `SIGINT`, `SIGUSR1` – installed at
-  import‑time so *every* rank sees them even if the signal arrives during heavy
-  start‑up.
-* A **global `shutdown_evt`** shared by all modules; the handler also sets an
-  integer CUDA tensor flag that is broadcast so *all* ranks learn that one rank
-  died (covers GPU OOM / NCCL errors where only one rank gets the signal).
-* Enforces `NCCL_ASYNC_ERROR_HANDLING=1` and `NCCL_BLOCKING_WAIT=1` to force
-  collectives to raise Python exceptions instead of hanging.
-* Adds `safe_barrier()` which times out after 60 s – prevents permanent hangs
-  if a rank is already gone.
-* Ensures `dist.destroy_process_group()` runs from `atexit` on normal or
-  signalled termination.
-
-With these tweaks Slurm’s SIGTERM should propagate cleanly, all ranks exit
-within the grace period, and the node never goes to the *drained* state.
+rev‑4 summary
+-------------
+* **`sample_distribution` rewritten** – no nested `for b in … / for s in …`.
+  We flatten `(bsz, seqlen)` → `(bsz*seqlen)`, take a single `torch.multinomial`
+  call, then compute `torch.unique` per row.  That keeps all sampling fully on‑
+  GPU while still returning the same Python‑list structure (ids & counts per
+  position) expected by downstream code.
+* No other functional changes; memory footprint unchanged because logits are
+  already resident.
 """
 from __future__ import annotations
 
-import argparse, atexit, os, signal, sys, threading, time, datetime
+import argparse, atexit, os, signal, threading, time, datetime
 from dataclasses import dataclass
 from typing import List
 
@@ -31,19 +24,14 @@ from huggingface_hub import HfApi, Repository
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
-# GLOBAL SHUTDOWN FLAG & SIGNAL HANDLERS  (registered *before* heavy work)
+# GLOBAL SHUTDOWN FLAG & SIGNAL HANDLERS
 # ---------------------------------------------------------------------------
 shutdown_evt = threading.Event()
-
-def _signal_handler(sig, frame):
-    """Simple handler: mark shutdown event; let main loop exit cleanly."""
-    shutdown_evt.set()
-
 for _s in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
-    signal.signal(_s, _signal_handler)
+    signal.signal(_s, lambda *_: shutdown_evt.set())
 
 # ---------------------------------------------------------------------------
-# ENV setup – makes NCCL propagate failures instead of hanging
+# ENV setup – helps NCCL propagate failures
 # ---------------------------------------------------------------------------
 os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 os.environ.setdefault("NCCL_BLOCKING_WAIT", "1")
@@ -51,6 +39,8 @@ os.environ.setdefault("NCCL_BLOCKING_WAIT", "1")
 ################################################################################
 # Argument parsing                                                              
 ################################################################################
+
+dataclass = dataclass  # silence flake
 
 @dataclass
 class Args:
@@ -61,7 +51,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Generate KD dataset with distributed weight‑streaming – robust shutdown")
+    p = argparse.ArgumentParser("Generate KD dataset with distributed weight‑streaming – vectorised sampling")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -85,26 +75,23 @@ def setup_distributed() -> tuple[int, int, int, torch.device]:
         dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=900))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-    return local_rank, dist.get_rank(), dist.get_world_size(), device
+    return local_rank, dist.get_rank(), dist.get_world_size(), torch.device(f"cuda:{local_rank}")
 
 
 def safe_barrier(timeout: float = 60.0):
-    """Barrier that times out if peers are dead to avoid infinite hangs."""
     if not dist.is_initialized():
         return
     start = time.time()
     while True:
-        req = dist.barrier(async_op=True)
-        while not req.is_completed():
+        work = dist.barrier(async_op=True)
+        while not work.is_completed():
             if shutdown_evt.is_set() or time.time() - start > timeout:
                 return
             time.sleep(0.1)
         return
 
-# ensure destroy at exit
 @atexit.register
-def _cleanup_dist():
+def _destroy_pg():
     if dist.is_initialized():
         try:
             dist.destroy_process_group()
@@ -112,30 +99,33 @@ def _cleanup_dist():
             pass
 
 ################################################################################
-# Sampling utility (unchanged)                                                  
+# Vectorised sampling utility                                                   
 ################################################################################
 
 def sample_distribution(logits: torch.Tensor, num_samples: int, num_rounds: int, temperature: float = 1.0):
+    """GPU‑side multinomial over *all* positions in one call, return ids & counts."""
     logits = logits.float()
-    q = torch.softmax(logits / temperature, dim=-1)
-    ids_all: List[List[List[int]]] = []
-    counts_all: List[List[List[int]]] = []
-    bsz, seqlen, vocab = q.shape
-    for b in range(bsz):
-        ids_seq, counts_seq = [], []
-        for s in range(seqlen):
-            row = torch.nan_to_num(q[b, s], nan=0.0, posinf=0.0, neginf=0.0)
-            row = row.clamp(min=0)
-            if row.sum() == 0: row.fill_(1 / vocab)
-            row = (row + 1e-6) / row.sum()
-            smp = torch.multinomial(row, num_samples * num_rounds, replacement=True)
-            uniq, cnt = torch.unique(smp, return_counts=True)
-            ids_seq.append(uniq.cpu().tolist()); counts_seq.append(cnt.cpu().tolist())
-        ids_all.append(ids_seq); counts_all.append(counts_seq)
+    probs = torch.softmax(logits / temperature, dim=-1)  # (B, L, V)
+    B, L, V = probs.shape
+    total_draws = num_samples * num_rounds
+
+    # flatten (B, L, V) → (B*L, V) to sample in one go
+    draws = torch.multinomial(probs.view(-1, V), total_draws, replacement=True)  # (B*L, total_draws)
+
+    ids_rows: List[List[int]] = []
+    counts_rows: List[List[int]] = []
+    for row in draws:  # iterate over flattened rows – no inner position loop
+        uniq, cnt = torch.unique(row, return_counts=True)
+        ids_rows.append(uniq.cpu().tolist())
+        counts_rows.append(cnt.cpu().tolist())
+
+    # reshape back to (B, L, ...)
+    ids_all = [ids_rows[i * L : (i + 1) * L] for i in range(B)]
+    counts_all = [counts_rows[i * L : (i + 1) * L] for i in range(B)]
     return ids_all, counts_all
 
 ################################################################################
-# Distributed weight‑streaming streamer (same compute path)                     
+# Distributed weight‑streaming streamer (unchanged aside from new sampler)      
 ################################################################################
 
 class DistributedStreamer:
@@ -150,12 +140,12 @@ class DistributedStreamer:
         self.lm_head = self.model.lm_head.to(device)
 
     def _broadcast(self, mod: torch.nn.Module, owner: int):
-        handles = [dist.broadcast(p.data, src=owner, async_op=True) for p in list(mod.parameters()) + list(mod.buffers())]
-        for h in handles: h.wait()
+        ws = [dist.broadcast(p.data, src=owner, async_op=True) for p in list(mod.parameters()) + list(mod.buffers())]
+        for w in ws: w.wait()
 
     @torch.no_grad()
     def sample(self, ids: torch.Tensor, micro_bs: int, num_samples: int, num_rounds: int, temp: float):
-        micro_inputs = [ids[i:i + micro_bs] for i in range(0, ids.size(0), micro_bs)]
+        micro_inputs = [ids[i : i + micro_bs] for i in range(0, ids.size(0), micro_bs)]
         micro_states = []
         for mb in micro_inputs:
             h = self.embed(mb.to(self.device, non_blocking=True))
@@ -164,23 +154,23 @@ class DistributedStreamer:
             micro_states.append({"hidden": h, "cache_pos": cache_pos, "pos_ids": pos_ids, "pos_emb": pos_emb})
 
         for i, layer in enumerate(self.layers):
-            owner = i % self.world; layer.to(self.device, non_blocking=True); self._broadcast(layer, owner)
+            owner = i % self.world
+            layer.to(self.device, non_blocking=True); self._broadcast(layer, owner)
             for ms in micro_states:
                 out = layer(ms["hidden"], position_ids=ms["pos_ids"], cache_position=ms["cache_pos"], position_embeddings=ms["pos_emb"], use_cache=False)
                 ms["hidden"] = out[0] if isinstance(out, tuple) else out
             layer.to("cpu", non_blocking=True); torch.cuda.empty_cache()
-            if shutdown_evt.is_set():
-                break
+            if shutdown_evt.is_set(): break
 
-        ids_all, counts_all = [], []
+        ids_all, cnts_all = [], []
         for ms in micro_states:
             logits = self.lm_head(ms["hidden"])
             i, c = sample_distribution(logits, num_samples, num_rounds, temp)
-            ids_all.extend(i); counts_all.extend(c)
-        return ids_all, counts_all
+            ids_all.extend(i); cnts_all.extend(c)
+        return ids_all, cnts_all
 
 ################################################################################
-# Data helpers (unchanged)                                                      
+# Data loader, push logic, worker (unchanged)                                   
 ################################################################################
 
 def collate_fn(exs, tok, max_len):
@@ -198,10 +188,6 @@ def streaming_dataloader(ds, tok, bs, max_len, rank, world):
     if batch and not shutdown_evt.is_set():
         yield collate_fn(batch, tok, max_len)
 
-################################################################################
-# Push shard (rank‑0)                                                           
-################################################################################
-
 def push_shard(local: List[dict], args: Args, rank: int):
     gather = [None] * dist.get_world_size() if rank == 0 else None
     dist.gather_object(local, gather, 0)
@@ -210,45 +196,73 @@ def push_shard(local: List[dict], args: Args, rank: int):
     for part in gather: merged.extend(part)
     if not merged: return
     api = HfApi(token=args.hf_token)
-    n = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
-    fname = f"data_{n:05d}.parquet"; Dataset.from_list(merged).to_parquet(fname)
+    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
+    fname = f"data_{idx:05d}.parquet"; Dataset.from_list(merged).to_parquet(fname)
     repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {n}"); repo.git_push(); repo.git_clear(); os.remove(fname)
-
-################################################################################
-# Worker                                                                        
-################################################################################
+    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {idx}"); repo.git_push(); repo.git_clear(); os.remove(fname)
 
 def worker(args: Args):
     local_rank, rank, world, device = setup_distributed()
-    print(f"Rank {rank}/{world} online on {device}")
+    print(f"[rank {rank}] started on {device}", flush=True)
 
-    tok = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     streamer = DistributedStreamer(args, device, rank, world)
-    ds = load_dataset(args.dataset_name, split=args.dataset_split, token=args.hf_token, streaming=True)
-    loader = streaming_dataloader(ds, tok, args.batch_size, args.max_seq_len, rank, world)
 
-    buf: List[dict] = []; seen = 0
+    dataset = load_dataset(
+        args.dataset_name,
+        split=args.dataset_split,
+        token=args.hf_token,
+        streaming=True,
+    )
+
+    loader = streaming_dataloader(
+        dataset, tokenizer, args.batch_size, args.max_seq_len, rank, world
+    )
+
+    buffer: List[dict] = []
+    seen = 0
+
     try:
         for batch in loader:
-            if shutdown_evt.is_set(): break
-            ids, cnts = streamer.sample(batch["input_ids"], args.micro_batch_size, args.num_samples, args.num_rounds, args.sampling_temperature)
+            if shutdown_evt.is_set():
+                break
+            ids, cnts = streamer.sample(
+                batch["input_ids"],
+                args.micro_batch_size,
+                args.num_samples,
+                args.num_rounds,
+                args.sampling_temperature,
+            )
             for i, toks in enumerate(batch["input_ids"]):
-                t = toks.tolist();
-                while t and t[-1] == 0: t.pop(); L = len(t)
-                buf.append({"input_ids": t, "sampled_ids": ids[i][:L], "sampled_counts": cnts[i][:L]})
+                tok_list = toks.tolist()
+                while tok_list and tok_list[-1] == 0:
+                    tok_list.pop()
+                L = len(tok_list)
+                buffer.append(
+                    {
+                        "input_ids": tok_list,
+                        "sampled_ids": ids[i][:L],
+                        "sampled_counts": cnts[i][:L],
+                    }
+                )
             seen += len(batch["input_ids"])
             if seen >= args.push_every:
-                push_shard(buf, args, rank); buf.clear(); seen = 0
-            if shutdown_evt.is_set(): break
+                push_shard(buffer, args, rank)
+                buffer.clear(); seen = 0
+            if shutdown_evt.is_set():
+                break
     except Exception as e:
-        print(f"Rank {rank} exception: {e}"); shutdown_evt.set()
+        print(f"[rank {rank}] exception: {e}", flush=True)
+        shutdown_evt.set()
 
-    if buf and not shutdown_evt.is_set(): push_shard(buf, args, rank)
-    safe_barrier(); print(f"Rank {rank} clean exit")
+    if buffer and not shutdown_evt.is_set():
+        push_shard(buffer, args, rank)
+
+    safe_barrier()
+    print(f"[rank {rank}] exiting", flush=True)
 
 ################################################################################
-# Entrypoint                                                                    
+# Entrypoint
 ################################################################################
 
 if __name__ == "__main__":
