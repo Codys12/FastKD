@@ -140,43 +140,46 @@ def sample_distribution(
 ################################################################################
 
 class DistributedStreamer:
-    """Streams model **layers** across devices, keeping activations resident."""
+    """Streams model **layers** across devices, keeping activations resident.
+
+    Fix: pass correct *position_ids*, *cache_position*, and *rotary* position **embeddings** to every
+    transformer block (required by Qwen‑3).
+    """
 
     def __init__(self, args: Args, device: torch.device, rank: int, world_size: int):
         self.rank = rank
         self.world_size = world_size
         self.device = device
 
-        # Load the full model on CPU first (no FlashAttn yet – avoids init issues)
+        # Load model on CPU first
         config = AutoConfig.from_pretrained(args.model_name)
         config.attn_implementation = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
             args.model_name, config=config, device_map={"": "cpu"}, torch_dtype=torch.bfloat16
         )
-        # enable flash after weight load so every rank can use it
+        # Switch to flash after weights are in place
         self.model.config.attn_implementation = "flash_attention_2"
 
+        # Convenience handles
         self.layers = list(self.model.model.layers)
-        self.embed = self.model.model.embed_tokens.to(self.device)  # replicated once
-        self.lm_head = self.model.lm_head.to(self.device)           # replicated once
+        self.rotary_emb_fn = self.model.model.rotary_emb  # Qwen3 exposes helper
+        self.embed = self.model.model.embed_tokens.to(self.device)
+        self.lm_head = self.model.lm_head.to(self.device)
 
-    # ---------------------------------------------------------------------
-    # helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # utils
+    # ------------------------------------------------------------------
     def _broadcast_module(self, module: torch.nn.Module, owner: int):
-        """Broadcast *in‑place* parameters & buffers of *module* from *owner* to all ranks."""
-        work_handles: List[dist.Work] = []
-        for p in module.parameters(recurse=True):
-            work_handles.append(dist.broadcast(p.data, src=owner, async_op=True))
-        for b in module.buffers(recurse=True):
-            work_handles.append(dist.broadcast(b.data, src=owner, async_op=True))
-        # Wait for parameter reception *before* computation but *after* async send.
-        for w in work_handles:
+        """Broadcast parameters & buffers from *owner* to all ranks asynchronously."""
+        works: List[dist.Work] = []
+        for t in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
+            works.append(dist.broadcast(t.data, src=owner, async_op=True))
+        for w in works:
             w.wait()
 
-    # ---------------------------------------------------------------------
-    # forward sampling                                                      
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # forward & sample
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def sample(
         self,
@@ -186,55 +189,51 @@ class DistributedStreamer:
         num_rounds: int,
         temperature: float = 1.0,
     ):
-        """Compute logits and sample using weight‑streaming pipeline."""
-        # --------------------------------------------------------------
-        # Prepare micro‑batches that stay resident on *this* GPU.
-        # --------------------------------------------------------------
-        batches = [
-            input_ids[i : i + micro_batch_size]
-            for i in range(0, input_ids.size(0), micro_batch_size)
-        ]
+        """Compute logits and sample using weight‑streaming pipeline, now with correct rotary inputs."""
+        # Split into resident micro‑batches
+        batches = [input_ids[i : i + micro_batch_size] for i in range(0, input_ids.size(0), micro_batch_size)]
 
         ids_all: List[List[List[int]]] = []
         counts_all: List[List[List[int]]] = []
 
-        # --------------------------------------------------------------
-        # Move TKNs to GPU once, keep until all layers processed.
-        # --------------------------------------------------------------
         for micro in batches:
-            hidden = micro.to(self.device, non_blocking=True)
-            hidden = self.embed(hidden)
+            # Put tokens on GPU & embed once
+            hidden = self.embed(micro.to(self.device, non_blocking=True))
 
-            # ------------------------------------------------------
-            # Stream every transformer block.
-            # Owner rotates deterministically: idx % world_size
-            # ------------------------------------------------------
+            # ------------------------------------------------------------------
+            # Build position helpers **once** per sequence.
+            # ------------------------------------------------------------------
+            seq_len = hidden.size(1)
+            cache_pos = torch.arange(seq_len, device=self.device)
+            position_ids = cache_pos.unsqueeze(0)  # (1, L)
+            pos_embeds = self.rotary_emb_fn(hidden, position_ids)  # cos/sin pair
+
+            # ------------------------------------------------------------------
+            # Stream every transformer block with proper positional args.
+            # ------------------------------------------------------------------
             for idx, layer in enumerate(self.layers):
                 owner = idx % self.world_size
+                layer.to(self.device, non_blocking=True)
+                self._broadcast_module(layer, owner)
 
-                # Owner moves weights to GPU; others create an uninit copy first.
-                layer_device_ready = layer.to(self.device, non_blocking=True)
-
-                # broadcast weights in‑place so all replicas match owner.
-                self._broadcast_module(layer_device_ready, owner)
-
-                # Execute layer on resident activations.
-                out = layer_device_ready(hidden, use_cache=False)
+                out = layer(
+                    hidden,
+                    position_ids=position_ids,
+                    cache_position=cache_pos,
+                    position_embeddings=pos_embeds,
+                    use_cache=False,
+                )
                 hidden = out[0] if isinstance(out, tuple) else out
 
-                # Free weights early to make room for next layer.
-                layer_device_ready.to("cpu", non_blocking=True)
+                layer.to("cpu", non_blocking=True)
                 torch.cuda.empty_cache()
 
-            # ------------------------------------------------------
-            # Final LM head (replicated), logits -> sample.
-            # ------------------------------------------------------
+            # ------------------------------------------------------------------
+            # LM head & multinomial sampling
+            # ------------------------------------------------------------------
             logits = self.lm_head(hidden)
             ids, counts = sample_distribution(
-                logits,
-                num_samples=num_samples,
-                num_rounds=num_rounds,
-                temperature=temperature,
+                logits, num_samples=num_samples, num_rounds=num_rounds, temperature=temperature
             )
             ids_all.extend(ids)
             counts_all.extend(counts)
