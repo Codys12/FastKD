@@ -151,11 +151,21 @@ class DistributedStreamer:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    def _async_broadcast(self, module: torch.nn.Module, owner: int):
-        """Return a list of async broadcast handles for *module*."""
-        handles = []
-        for t in list(module.parameters()) + list(module.buffers()):
-            handles.append(dist.broadcast(t.data, src=owner, async_op=True))
+        def _async_broadcast(self, module: torch.nn.Module, owner: int):
+        """Ensure every tensor is on *self.device*, then broadcast async.
+
+        NCCL cannot send CPU tensors, so for every param/buffer that is still on
+        CPU we first allocate a *placeholder* tensor on this GPU (same dtype &
+        shape) and swap it into `module` before the broadcast call.
+        """
+        handles: List[dist.Work] = []
+        with torch.no_grad():
+            for t in list(module.parameters()) + list(module.buffers()):
+                if t.device != self.device:
+                    # create un‑initialised tensor on GPU with same shape/dtype
+                    empty_cuda = torch.empty_like(t, device=self.device)
+                    t.data = empty_cuda  # swap in‑place so broadcast can fill it
+                handles.append(dist.broadcast(t.data, src=owner, async_op=True))
         return handles
 
     # ------------------------------------------------------------------
@@ -177,13 +187,14 @@ class DistributedStreamer:
         # 2. Double‑buffered layer stream ----------------------------------------------
         prefetch_handles = []  # async handles for the *next* layer
 
-        # Prefetch layer‑0 synchronously to kick things off
+                # Prefetch layer‑0 synchronously to kick things off
         first_layer = self.layers[0]
         owner0 = 0 % self.world
         if self.rank == owner0:
             first_layer.to(self.device, non_blocking=True)
-        self._async_broadcast(first_layer, owner0)  # wait immediately so weights are ready
-        for h in prefetch_handles: h.wait()
+        first_handles = self._async_broadcast(first_layer, owner0)
+        for h in first_handles:
+            h.wait()
         prefetch_handles = []
 
         for idx, layer in enumerate(self.layers):
@@ -195,9 +206,7 @@ class DistributedStreamer:
                     h.wait()
                 prefetch_handles = []
 
-            # If this rank wasn't owner, weights may still be on CPU -> broadcast already
-            if layer.weight.device != self.device:
-                layer.to(self.device, non_blocking=True)
+                        # current layer is already on GPU thanks to broadcast; no owner‑device check needed
 
             # ---- compute current layer over all micro‑batches ----
             for ms in micro_states:
@@ -221,6 +230,10 @@ class DistributedStreamer:
 
             # Free current layer weights to keep at most 2 layers resident
             layer.to("cpu", non_blocking=True)
+            torch.cuda.empty_cache()
+
+            if shutdown_evt.is_set():
+                break, non_blocking=True)
             torch.cuda.empty_cache()
 
             if shutdown_evt.is_set():
