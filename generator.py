@@ -115,10 +115,17 @@ class ReversePipelineEngine:
             model.config.attn_implementation = "flash_attention_2"
         else:
             model = AutoModelForCausalLM.from_config(base_cfg)
+                        # Lightweight skeleton: immediately convert params to **meta** with same shape/dtype so
+            # we keep structural information but allocate no real memory.
             for p in model.parameters():
-                p.data = torch.empty(0, device="meta")
+                with torch.no_grad():
+                    p.data = torch.empty_like(p.data, device="meta")
 
         self.layers: List[torch.nn.Module] = [
+            model.model.embed_tokens,
+            *model.model.layers,
+            model.lm_head,
+        ]: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
             model.lm_head,
