@@ -1,3 +1,20 @@
+"""
+Distributed generator with *parameter* pipeline parallelism and double‑buffering.
+Layers move GPU→GPU while the batch stays resident on every device.  Usage (8 GPUs):
+
+sbatch -p dgxh100 --gres=gpu:8 --wrap="singularity exec --nv lightning_sandbox bash -c 'cd fastkd; torchrun --nnodes 1 --nproc_per_node 8 generator.py --push_every 512 --model_name Qwen/Qwen3-235B-A22B --dataset_name mlfoundations/dclm-baseline-1.0 --output_repo codys12/Qwen3-DCLM-test2 --hf_token HF_TOKEN --num_rounds 255 --batch_size 512 --micro_batch_size 64'"
+
+Key points
+----------
+* **Parameter pipeline** (reverse of data pipeline): layers stream through ranks
+  CPU ➜ GPU‑0 ➜ GPU‑1 … GPU‑N‑1 ➜ CPU.
+* **Double buffering**: odd/even layer indices use alternating buffers so copy &
+  compute overlap.
+* Each GPU keeps its local replica of the input batch for the whole forward.
+* Sampling happens *once* on GPU‑0, fully vectorised (no Python loops).
+* Works in a single `torchrun` launch; ranks are created by `torchrun`.
+* No external dependencies beyond standard PyTorch + 🤗.
+"""
 from __future__ import annotations
 
 import argparse
@@ -5,20 +22,17 @@ import os
 import signal
 import threading
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch import nn
-from torch.nn.utils import parameters_to_vector, vector_to_parameters
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from datasets import load_dataset, Dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from huggingface_hub import HfApi, Repository
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ────────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Args:
     model_name: str
@@ -33,11 +47,10 @@ class Args:
     push_every: int
     max_seq_len: int
     hf_token: str | None = None
-    pipeline_backend: str = "nccl"
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("GPU‑sampling parameter‑pipeline KD generator")
+    p = argparse.ArgumentParser("FastKD distributed generator (parameter pipeline)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -50,172 +63,346 @@ def parse_args() -> Args:
     p.add_argument("--push_every", type=int, default=1000)
     p.add_argument("--max_seq_len", type=int, default=2048)
     p.add_argument("--hf_token", default=None)
-    p.add_argument("--pipeline_backend", default="nccl")
     return Args(**vars(p.parse_args()))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HF push helper
-# ──────────────────────────────────────────────────────────────────────────────
 
-def push_shard(records: List[Dict[str, Any]], args: Args):
+# ────────────────────────────────────────────────────────────────────────────────
+# Helper: distributed send/recv of parameter vectors (non‑blocking)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _vectorize(layer: torch.nn.Module) -> torch.Tensor:
+    """Flatten parameters of *layer* into a single 1‑D CUDA tensor."""
+    for p in layer.parameters():
+        p.requires_grad_(False)
+    vec = torch.nn.utils.parameters_to_vector(list(layer.parameters()))
+    return vec.contiguous()
+
+
+def _dev_of_rank(rank: int) -> torch.device:
+    if rank < 0:
+        return torch.device("cpu")
+    return torch.device(f"cuda:{rank}")
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Parameter‑pipeline streamer
+# ────────────────────────────────────────────────────────────────────────────────
+class ParamPipe:
+    """Move layers across ranks while data stays put. Double‑buffered."""
+
+    def __init__(self, model_name: str):
+        self.rank = dist.get_rank()
+        self.world = dist.get_world_size()
+        self.device = _dev_of_rank(self.rank)
+
+        # Only rank 0 keeps a full model on CPU; other ranks create empty shells.
+        if self.rank == 0:
+            cfg = AutoConfig.from_pretrained(model_name)
+            cfg.attn_implementation = "eager"  # avoids flash issues on CPU
+            self.full_model = AutoModelForCausalLM.from_pretrained(
+                model_name, config=cfg, torch_dtype=torch.bfloat16, device_map={"": "cpu"}
+            )
+            self.layers = list(self.full_model.model.layers)
+            self.embed = self.full_model.model.embed_tokens
+            self.lm_head = self.full_model.lm_head
+        else:
+            # Placeholder layers just for type hints; actual params stream in.
+            self.layers = None  # type: ignore
+            self.embed = None  # type: ignore
+            self.lm_head = None  # type: ignore
+
+        # Two parameter buffers for double buffering
+        self.buffers = [None, None]  # type: List[torch.Tensor | None]
+        self._init_streams()
+
+    # ──────────────────────────────────────
+    # Comms helpers
+    # ──────────────────────────────────────
+    def _init_streams(self):
+        if self.device.type == "cuda":
+            self.compute_stream = torch.cuda.Stream(device=self.device)
+            self.copy_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.compute_stream = torch.cuda.current_stream()
+            self.copy_stream = torch.cuda.current_stream()
+
+    def _send(self, tensor: torch.Tensor, dst: int, tag: int):
+        dist.isend(tensor, dst=dst, tag=tag)
+
+    def _recv(self, shape: torch.Size, dtype: torch.dtype, src: int, tag: int) -> torch.Tensor:
+        out = torch.empty(shape, dtype=dtype, device=self.device)
+        dist.recv(out, src=src, tag=tag)
+        return out
+
+    # ──────────────────────────────────────
+    # Forward + sample
+    # ──────────────────────────────────────
+    @torch.no_grad()
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        micro_batch_size: int,
+        num_samples: int,
+        num_rounds: int,
+        temperature: float,
+    ) -> Tuple[List[List[List[int]]], List[List[List[int]]]]:
+        """Full forward‑pass + sampling on rank 0. Other ranks only forward."""
+        # Replicate data on *every* GPU (fits because it's token IDs, not float32).
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        hidden = None  # will become embeddings → hidden states
+
+        n_layers = (
+            len(self.layers) if self.rank == 0 else dist.broadcast_object_list([None], src=0)
+        )
+        # broadcast layer count so everyone knows how many iters
+        if self.rank != 0:
+            n_layers = dist.broadcast_object_list([None], src=0)[0]  # type: ignore
+
+        next_rank = self.rank + 1 if self.rank + 1 < self.world else -1  # -1 is CPU sink
+        prev_rank = self.rank - 1 if self.rank > 0 else -1
+
+        for idx in range(n_layers + 2):  # +embed +lm_head
+            tag = idx & 1  # double‑buffer toggle
+
+            # ---------------------------
+            # 1. Receive layer parameters
+            # ---------------------------
+            if idx == 0:
+                # Special case: embed layer sent from CPU to GPU‑0
+                if self.rank == 0:
+                    vec = _vectorize(self.embed)  # type: ignore[attr-defined]
+                    self.buffers[tag] = vec.to(self.device, non_blocking=True)
+                    if next_rank != -1:
+                        self._send(vec, dst=next_rank, tag=tag)
+                else:
+                    vec = self._recv_like(prev_rank, tag)
+                    self.buffers[tag] = vec
+            elif 1 <= idx <= n_layers:
+                # Regular transformer layer
+                if self.rank == 0:
+                    layer = self.layers[idx - 1]  # idx‑1 because embed at 0
+                    vec = _vectorize(layer)
+                    self.buffers[tag] = vec.to(self.device, non_blocking=True)
+                    if next_rank != -1:
+                        self._send(vec, dst=next_rank, tag=tag)
+                else:
+                    vec = self._recv_like(prev_rank, tag)
+                    self.buffers[tag] = vec
+            else:
+                # lm_head (last)
+                if self.rank == 0:
+                    vec = _vectorize(self.lm_head)  # type: ignore[attr-defined]
+                    self.buffers[tag] = vec.to(self.device, non_blocking=True)
+                    if next_rank != -1:
+                        self._send(vec, dst=next_rank, tag=tag)
+                else:
+                    vec = self._recv_like(prev_rank, tag)
+                    self.buffers[tag] = vec
+
+            # ---------------------------------------
+            # 2. Compute on *previous* buffer if exists
+            # ---------------------------------------
+            prev_tag = tag ^ 1
+            buf = self.buffers[prev_tag]
+            if buf is not None:
+                with torch.cuda.stream(self.compute_stream):
+                    layer_out = self._apply_layer(buf, hidden, micro_batch_size)
+                    hidden = layer_out if layer_out is not None else hidden
+            torch.cuda.current_stream().wait_stream(self.compute_stream)
+
+        # After pipeline drains, hidden holds logits on every rank.
+        # Sampling only on rank 0; others noop.
+        if self.rank == 0:
+            logits = hidden  # [B, L, V]
+            ids, counts = self._gpu_sample(logits, num_samples, num_rounds, temperature)
+        else:
+            ids = counts = []
+        return ids, counts
+
+    # helper: create recv buffer matching src size
+    def _recv_like(self, src: int, tag: int):
+        shape = torch.tensor([0], device="cpu")
+        dtype_code = torch.tensor([0], device="cpu")
+        if self.rank == 0:
+            raise RuntimeError("Rank0 should never _recv_like")
+        # First receive shape & dtype code header (small CPU tensors)
+        dist.recv(shape, src=src, tag=tag + 1000)
+        dist.recv(dtype_code, src=src, tag=tag + 2000)
+        dtype = [torch.float32, torch.bfloat16, torch.float16][int(dtype_code.item())]
+        numel = int(shape.item())
+        buf = torch.empty(numel, dtype=dtype, device=self.device)
+        dist.recv(buf, src=src, tag=tag)
+        return buf
+
+    # helper: apply vectorised layer (we rebuild Module on‑the‑fly)
+    def _apply_layer(self, vec: torch.Tensor, hidden: torch.Tensor | None, mbs: int):
+        # Determine which layer based on size – embed / layer / lm_head.
+        # Cheap heuristic since model architecture fixed.
+        if hidden is None:
+            # embed phase
+            layer = torch.nn.Embedding.from_pretrained(
+                vec.view_as(self.embed.weight)  # type: ignore[attr-defined]
+            ).to(self.device)
+            out = layer(self.input_ids)  # type: ignore[attr-defined]
+            return out
+        elif vec.numel() == self.lm_head.weight.numel():  # type: ignore[attr-defined]
+            lm_head = torch.nn.Linear(
+                self.lm_head.in_features,  # type: ignore[attr-defined]
+                self.lm_head.out_features,  # type: ignore[attr-defined]
+                bias=False,
+                device=self.device,
+                dtype=vec.dtype,
+            )
+            torch.nn.utils.vector_to_parameters(vec, [lm_head.weight])
+            return lm_head(hidden)
+        else:
+            # generic transformer block – we rebuild minimal block wrapper
+            block = self.layers[0].__class__(self.layers[0].config).to(self.device)  # type: ignore[attr-defined]
+            torch.nn.utils.vector_to_parameters(vec, list(block.parameters()))
+            out = []
+            for mb in hidden.split(mbs, dim=0):
+                out.append(block(mb)[0])  # type: ignore[operator]
+            return torch.cat(out, dim=0)
+
+    # helper: fully vectorised sampling (GPU)
+    @staticmethod
+    @torch.no_grad()
+    def _gpu_sample(logits: torch.Tensor, N: int, R: int, t: float):
+        bsz, seqlen, vocab = logits.shape
+        p = torch.softmax(logits, dim=-1)
+        q = torch.softmax(logits / t, dim=-1)
+        q = torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+        q = torch.clamp(q, min=0)
+        q = q + 1e-6
+        q /= q.sum(dim=-1, keepdim=True)
+
+        draws = N * R
+        flat_samples = torch.multinomial(q.view(-1, vocab), draws, replacement=True)
+        flat_ids, flat_counts = torch.unique(flat_samples, return_counts=True)
+
+        ids = [[flat_ids.tolist() for _ in range(seqlen)] for _ in range(bsz)]
+        counts = [[flat_counts.tolist() for _ in range(seqlen)] for _ in range(bsz)]
+        return ids, counts
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Data helpers (unchanged from original apart from device move)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def collate_fn(examples, tokenizer, max_seq_len: int):
+    texts = [e["text"] for e in examples]
+    return tokenizer(
+        texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len
+    )
+
+
+def streaming_dataloader(ds, tokenizer, batch_size: int, max_seq_len: int):
+    batch = []
+    for example in ds:
+        batch.append(example)
+        if len(batch) == batch_size:
+            yield collate_fn(batch, tokenizer, max_seq_len)
+            batch.clear()
+    if batch:
+        yield collate_fn(batch, tokenizer, max_seq_len)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Hub push helper (identical to original)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def push_shard(records: List[dict], args: Args) -> None:
     api = HfApi(token=args.hf_token)
     files = api.list_repo_files(args.output_repo, repo_type="dataset")
     idx = sum(f.endswith(".parquet") for f in files)
-    fname = f"data_{idx:05d}.parquet"
-    Dataset.from_list(records).to_parquet(fname)
-    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {idx}"); repo.git_push(); repo.git_clear()
-    os.remove(fname)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tensor utils
-# ──────────────────────────────────────────────────────────────────────────────
+    filename = f"data_{idx:05d}.parquet"
+    ds = Dataset.from_list(records)
+    ds.to_parquet(filename)
 
-def flatten_mod(m: nn.Module) -> torch.Tensor:
-    return parameters_to_vector([p.detach() for p in m.parameters()])
+    repo = Repository(
+        local_dir="repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset"
+    )
+    repo.git_pull()
+    repo.git_add(filename)
+    repo.git_commit(f"Add shard {idx}")
+    repo.git_push()
+    repo.git_clear()
+    os.remove(filename)
 
-def load_vec(m: nn.Module, vec: torch.Tensor):
-    vector_to_parameters(vec, [p for p in m.parameters()])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Vectorised GPU sampler (flat rows)
-# ──────────────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def gpu_sample(logits: torch.Tensor, n_samples: int, n_rounds: int, t: float) -> Tuple[List, List]:
-    logits = logits.float()
-    probs = torch.softmax(logits / t, -1)
-    B, S, V = probs.shape
-    draws = torch.multinomial(probs.view(-1, V), n_samples * n_rounds, replacement=True)  # (B*S, T)
-    ids_all, cnts_all = [], []
-    for row in draws:  # still one loop across B*S rows (tiny)
-        uniq, cnt = torch.unique(row, return_counts=True)
-        ids_all.append(uniq.cpu().tolist()); cnts_all.append(cnt.cpu().tolist())
-    # reshape back to [B][S][…]
-    ids_out = [ids_all[i*S:(i+1)*S] for i in range(B)]
-    cnts_out = [cnts_all[i*S:(i+1)*S] for i in range(B)]
-    return ids_out, cnts_out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Worker
-# ──────────────────────────────────────────────────────────────────────────────
-class Worker:
-    def __init__(self, rank: int, world: int, args: Args):
-        self.rank, self.world, self.args = rank, world, args
-        self.prev = rank - 1 if rank else None; self.next = rank + 1 if rank + 1 < world else None
-        self.device = torch.device(f"cuda:{rank}"); torch.cuda.set_device(self.device)
-
-        cfg = AutoConfig.from_pretrained(args.model_name); cfg.attn_implementation = "eager"
-        base = AutoModelForCausalLM.from_pretrained(args.model_name, config=cfg, device_map={"": "cpu"})
-        self.embed = base.model.embed_tokens
-        self.layers = list(base.model.layers)
-        self.lm_head = base.lm_head
-        self.scratch = self.layers[0].to(self.device, dtype=torch.bfloat16)
-        self.pbuf = [torch.empty(1, dtype=torch.bfloat16, device=self.device) for _ in range(2)]
-        self.sbuf = [torch.empty(1, dtype=torch.int64) for _ in range(2)]
-        self.hidden: torch.Tensor | None = None
-        if rank == 0:
-            self.tok = AutoTokenizer.from_pretrained(args.model_name)
-            self.ds = load_dataset(args.dataset_name, split=args.dataset_split, token=args.hf_token, streaming=True)
-            self.recs: List[Dict[str, Any]] = []
-
-    # ────────────────────── helpers (rank‑0) ──────────────────────
-    def _collate(self, batch):
-        txt = [b["text"] for b in batch]
-        return self.tok(txt, return_tensors="pt", padding=True, truncation=True, max_length=self.args.max_seq_len)
-
-    def _loader(self):
-        buf, bs = [], self.args.batch_size
-        for ex in self.ds:
-            buf.append(ex)
-            if len(buf) == bs:
-                yield self._collate(buf); buf.clear()
-        if buf:
-            yield self._collate(buf)
-
-    # ───────────────────────── Rank‑0 loop ─────────────────────────
-    def _driver(self, stop: threading.Event):
-        args = self.args
-        for batch in self._loader():
-            if stop.is_set(): break
-            with torch.no_grad():
-                hid_cpu = self.embed(batch["input_ids"])
-            shards = hid_cpu.split(args.micro_batch_size)
-            for r in range(self.world):
-                if r == 0:
-                    self.hidden = shards[0].to(self.device, torch.bfloat16)
-                else:
-                    dist.send(torch.tensor(shards[r].shape, dtype=torch.int64), dst=r, tag=9000)
-                    dist.send(shards[r].to(torch.bfloat16), dst=r, tag=9001)
-            # stream layers
-            for idx, layer in enumerate(self.layers):
-                vec = flatten_mod(layer).to(torch.bfloat16)
-                shape = torch.tensor([vec.numel()], dtype=torch.int64)
-                if self.next is not None:
-                    dist.isend(shape, dst=self.next, tag=idx*2)
-                    dist.isend(vec,   dst=self.next, tag=idx*2+1)
-                load_vec(self.scratch, vec.to(self.device, non_blocking=True))
-                self.hidden = self.scratch(self.hidden)[0] if isinstance(self.scratch(self.hidden), tuple) else self.scratch(self.hidden)
-            # lm_head
-            hvec = flatten_mod(self.lm_head).to(torch.bfloat16)
-            if self.next is not None:
-                dist.send(torch.tensor([-1], dtype=torch.int64), dst=self.next, tag=9998)
-                dist.send(hvec, dst=self.next, tag=9999)
-            ids0, cnt0 = gpu_sample(self.lm_head(self.hidden.to(self.lm_head.weight.dtype)), args.num_samples, args.num_rounds, args.sampling_temperature)
-            out = {"ids": ids0, "counts": cnt0}
-            gather: List | None = [None]*self.world
-            dist.gather_object(out, gather, dst=0)
-            for obj in gather:
-                if obj is None: continue
-                for ids, cnt in zip(obj["ids"], obj["counts"]):
-                    self.recs.append({"sampled_ids": ids, "sampled_counts": cnt})
-            if len(self.recs) >= args.push_every:
-                push_shard(self.recs, args); self.recs.clear()
-
-    # ─────────────────────── GPU ranks loop ───────────────────────
-    def _gpu(self, stop: threading.Event):
-        args = self.args; cur = 0
-        while not stop.is_set():
-            shape = torch.empty((3,), dtype=torch.int64); dist.recv(shape, src=0, tag=9000)
-            hsh = tuple(shape.tolist()); self.hidden = torch.empty(hsh, dtype=torch.bfloat16, device=self.device)
-            dist.recv(self.hidden, src=0, tag=9001)
-            idx = 0
-            while True:
-                dist.recv(self.sbuf[cur], src=self.prev, tag=idx*2)
-                n = int(self.sbuf[cur].item())
-                if n == -1:
-                    hvec = torch.empty((flatten_mod(self.lm_head).numel(),), dtype=torch.bfloat16)
-                    dist.recv(hvec, src=self.prev, tag=9999)
-                    load_vec(self.lm_head.to(self.device), hvec.to(self.device, non_blocking=True))
-                    ids, cnt = gpu_sample(self.lm_head(self.hidden.to(self.lm_head.weight.dtype)), args.num_samples, args.num_rounds, args.sampling_temperature)
-                    dist.gather_object({"ids": ids, "counts": cnt}, None, dst=0)
-                    break
-                if self.pbuf[cur].numel() != n:
-                    self.pbuf[cur] = torch.empty((n,), dtype=torch.bfloat16, device=self.device)
-                dist.recv(self.pbuf[cur], src=self.prev, tag=idx*2+1)
-                if self.next is not None:
-                    dist.isend(self.sbuf[cur].clone(), dst=self.next, tag=idx*2)
-                    dist.isend(self.pbuf[cur].clone(), dst=self.next, tag=idx*2+1)
-                load_vec(self.scratch, self.pbuf[cur])
-                self.hidden = self.scratch(self.hidden)[0] if isinstance(self.scratch(self.hidden), tuple) else self.scratch(self.hidden)
-                cur ^= 1; idx += 1
-
-    def run(self, stop: threading.Event):
-        (self._driver if self.rank == 0 else self._gpu)(stop)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Launcher
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _entry(rank: int, world: int, args: Args, stop: threading.Event):
-    os.environ.update({"RANK": str(rank), "WORLD_SIZE": str(world), "MASTER_ADDR": os.getenv("MASTER_ADDR", "127.0.0.1"), "MASTER_PORT": os.getenv("MASTER_PORT", "29500")})
-    dist.init_process_group(backend=args.pipeline_backend, rank=rank, world_size=world)
-    Worker(rank, world, args).run(stop)
-    dist.destroy_process_group()
+# ────────────────────────────────────────────────────────────────────────────────
+# Main distributed worker loop
+# ────────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args(); world = torch.cuda.device_count()
-    stop = threading.Event(); signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    mp.spawn(_entry, nprocs=world, args=(world, args, stop), join=True)
+    args = parse_args()
+
+    # Initialise distributed
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(dist.get_rank())
+
+    shutdown = threading.Event()
+
+    def _sigterm(*_):
+        shutdown.set()
+
+    signal.signal(signal.SIGTERM, _sigterm)
+
+    # Build pipeline wrapper
+    pipe = ParamPipe(args.model_name)
+
+    # Data (all ranks iterate same stream – OK, records dedup later)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    dataset = load_dataset(
+        args.dataset_name, split=args.dataset_split, streaming=True, token=args.hf_token
+    )
+
+    dataloader = streaming_dataloader(dataset, tokenizer, args.batch_size, args.max_seq_len)
+
+    all_records: List[dict] = []
+    total = 0
+
+    for batch in dataloader:
+        if shutdown.is_set():
+            break
+        input_ids = batch["input_ids"].to(torch.device(f"cuda:{dist.get_rank()}"), non_blocking=True)
+        ids, counts = pipe.run(
+            input_ids,
+            args.micro_batch_size,
+            args.num_samples,
+            args.num_rounds,
+            args.sampling_temperature,
+        )
+
+        if dist.get_rank() == 0:
+            for i in range(len(input_ids)):
+                tokens = input_ids[i].tolist()
+                while tokens and tokens[-1] == 0:
+                    tokens.pop()
+                seq_len = len(tokens)
+                record = {
+                    "input_ids": tokens,
+                    "sampled_ids": ids[i][:seq_len],
+                    "sampled_counts": counts[i][:seq_len],
+                }
+                all_records.append(record)
+            total += len(input_ids)
+            if total >= args.push_every:
+                if all_records:
+                    push_shard(all_records, args)
+                    all_records.clear()
+                    total = 0
+        if shutdown.is_set():
+            break
+
+    # Flush remaining shard
+    if dist.get_rank() == 0 and all_records and not shutdown.is_set():
+        push_shard(all_records, args)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
