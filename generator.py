@@ -131,127 +131,17 @@ class ReversePipelineEngine:
             model.config.attn_implementation = "flash_attention_2"
         else:
             dbg("Building empty‑weight skeleton (meta)…")
-            # Robust meta‑initialisation compatible with accelerate>=0.26
-            from accelerate.utils import init_empty_weights
-            with init_empty_weights():
+            # Try accelerate's helper; fall back to manual meta tensors if not available
+            try:
+                from accelerate.utils import init_empty_weights  # accelerate>=0.26
+                with init_empty_weights():
+                    model = AutoModelForCausalLM.from_config(cfg)
+            except ImportError:
+                dbg("accelerate.init_empty_weights missing; using manual meta tensors …")
                 model = AutoModelForCausalLM.from_config(cfg)
-
-
-        # ---------- single, correct layers list (no duplicates!) ----------
-        self.layers: List[torch.nn.Module] = [
-            model.model.embed_tokens,
-            *model.model.layers,
-            model.lm_head,
-        ]
-        dbg(f"Total layers: {len(self.layers)}")
-
-        self.buffers = (_FlatPacket(), _FlatPacket())
-        self.toggle = 0
-
-    # ------------------------------ ring helpers -------------------------
-
-    def _ring_send(self, tensor: torch.Tensor, dst: int):
-        self.dbg(f"send → {dst}, numel={tensor.numel()}")
-        dist.send(tensor, dst)
-
-    def _ring_recv(self, tensor: torch.Tensor, src: int):
-        self.dbg(f"recv ← {src}, expect numel={tensor.numel()}")
-        dist.recv(tensor, src)
-
-    # ------------------------------ layer streaming ----------------------
-
-    def _stream_layer(self, idx: int):
-        left = (self.rank - 1) % self.world
-        right = (self.rank + 1) % self.world
-        buf = self.buffers[self.toggle]
-
-        if not (self.rank == 0 and idx == 0):
-            shape = torch.empty(1, dtype=torch.int64, device=self.device)
-            self._ring_recv(shape, left)
-            buf.make_empty(int(shape.item()), self.device)
-            self._ring_recv(buf.flat, left)
-        else:
-            buf.pack(self.layers[idx], self.device)
-
-        buf.unpack_to(self.layers[idx])  # materialise on this GPU
-
-        shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
-        self._ring_send(shape_out, right)
-        self._ring_send(buf.flat, right)
-
-        self.toggle ^= 1
-
-    # ------------------------------ forward & sample ---------------------
-
-    @torch.no_grad()
-    def _forward_full(self, hidden: torch.Tensor) -> torch.Tensor:
-        for idx in range(len(self.layers)):
-            self.dbg(f"Layer {idx}/{len(self.layers)-1} start")
-            self._stream_layer(idx)
-            layer = self.layers[idx].to(self.device, non_blocking=True)
-            for start in range(0, hidden.size(0), self.args.micro_batch_size):
-                mb = hidden[start : start + self.args.micro_batch_size]
-                out = layer(mb)
-                hidden[start : start + self.args.micro_batch_size] = out[0] if isinstance(out, tuple) else out
-            layer.to("cpu", non_blocking=True)
-            torch.cuda.current_stream().synchronize()
-            self.dbg(f"Layer {idx} done")
-        return hidden  # logits
-
-    @torch.no_grad()
-    def sample(self, hidden: torch.Tensor):
-        logits = self._forward_full(hidden)
-        probs = torch.softmax(logits / self.args.sampling_temperature, dim=-1)
-        draws = torch.multinomial(
-            probs.view(-1, probs.size(-1)),
-            self.args.num_samples * self.args.num_rounds,
-            replacement=True,
-        ).view(*probs.shape[:-1], -1)
-
-        ids_all, counts_all = [], []
-        for b in range(draws.size(0)):
-            ids_seq, cnt_seq = [], []
-            for t in range(draws.size(1)):
-                uniq, cnt = torch.unique(draws[b, t], return_counts=True)
-                ids_seq.append(uniq.cpu().tolist())
-                cnt_seq.append(cnt.cpu().tolist())
-            ids_all.append(ids_seq)
-            counts_all.append(cnt_seq)
-        return ids_all, counts_all
-
-###############################################################################
-#                    Data utilities & Hub push                               #
-###############################################################################
-
-def collate_fn(examples, tok, max_len):
-    return tok([e["text"] for e in examples], return_tensors="pt", padding=True, truncation=True, max_length=max_len)
-
-def stream_loader(ds, tok, bs, max_len):
-    buf = []
-    for ex in ds:
-        buf.append(ex)
-        if len(buf) == bs:
-            yield collate_fn(buf, tok, max_len)
-            buf.clear()
-    if buf:
-        yield collate_fn(buf, tok, max_len)
-
-def push_shard(records: List[dict], args: Args, dbg):
-    dbg(f"Pushing {len(records)} records to Hub…")
-    api = HfApi(token=args.hf_token)
-    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
-    fname = f"data_{idx:05d}.parquet"
-    Dataset.from_list(records).to_parquet(fname)
-    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {idx}"); repo.git_push(); repo.git_clear()
-    os.remove(fname)
-
-###############################################################################
-#                                   Worker                                   #
-###############################################################################
-
-def _gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
-    """Gather python‑object shards to rank‑0 and push a single parquet file."""
+                for p in model.parameters():
+                    p.data = torch.empty_like(p.data, device="meta")
+Gather python‑object shards to rank‑0 and push a single parquet file."""
     gathered = [None] * world if rank == 0 else None
     dist.gather_object(local, gathered, dst=0)
     if rank == 0:
