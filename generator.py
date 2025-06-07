@@ -8,15 +8,13 @@ GPU‑0 stays bounded.
 
 Key implementation points
 -------------------------
-* **CUDA tensors only** in `dist.send/recv` ➟ avoids the «No backend type associated
-  with device type cpu» error.
-* **Skeleton weights on non‑zero ranks** are initialised as *meta* tensors with
-  the same *shape* and **bfloat16** dtype; real parameters arrive via the ring.
-* **Double‑buffering** hides latency: while one buffer is used for compute, the
-  other is in flight to the next rank.
-* **Vectorised multinomial**: sampling is a single GPU call—no Python loops.
+* **CUDA tensors only** in `dist.send/recv` ➟ avoids CPU‑backend errors.
+* **Skeleton weights on non‑zero ranks**: stored as *meta* tensors (same shape &
+  dtype) so they allocate **zero** real memory until packets arrive.
+* **Double‑buffering** overlaps weight transfer and compute.
+* **Vectorised multinomial** for fast sampling.
 
-The script still matches your SLURM launch line verbatim.
+Launch command unchanged – works with `torchrun --nproc_per_node 8 …`.
 """
 
 import argparse
@@ -73,15 +71,12 @@ def parse_args() -> Args:
 ###############################################################################
 
 class _FlatPacket:
-    """Simple container that flattens parameters for efficient P2P transfer."""
+    """Flatten parameters into a contiguous CUDA tensor for fast P2P."""
 
     def __init__(self):
-        self.flat: torch.Tensor | None = None  # always CUDA when populated
-
-    # ---------------------------------------------------------------- pack/unpack
+        self.flat: torch.Tensor | None = None
 
     def pack(self, layer: torch.nn.Module, device: torch.device) -> None:
-        """Flatten `layer` params into a single contiguous CUDA tensor."""
         with torch.no_grad():
             vec = [p.data.view(-1) for p in layer.parameters()]
             self.flat = torch.cat(vec).contiguous().to(device, non_blocking=True)
@@ -91,7 +86,7 @@ class _FlatPacket:
 
     def unpack_to(self, layer: torch.nn.Module) -> None:
         if self.flat is None:
-            raise RuntimeError("_FlatPacket is empty — cannot unpack")
+            raise RuntimeError("Attempt to unpack empty packet")
         offset = 0
         with torch.no_grad():
             for p in layer.parameters():
@@ -104,7 +99,7 @@ class _FlatPacket:
 ###############################################################################
 
 class ReversePipelineEngine:
-    """Streams *layers* through static hidden‑states in a ring topology."""
+    """Stream *layers* through static hidden‑states on each GPU."""
 
     def __init__(self, args: Args, rank: int, world: int):
         self.args = args
@@ -113,9 +108,9 @@ class ReversePipelineEngine:
         self.device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(self.device)
 
-        # ---------------------------------------------------------------- model skeleton
+        # ------------------------------ model skeleton
         cfg = AutoConfig.from_pretrained(args.model_name)
-        cfg.attn_implementation = "eager"  # safe on CPU
+        cfg.attn_implementation = "eager"
 
         if rank == 0:
             model = AutoModelForCausalLM.from_pretrained(
@@ -127,9 +122,7 @@ class ReversePipelineEngine:
             model.config.attn_implementation = "flash_attention_2"
         else:
             model = AutoModelForCausalLM.from_config(cfg)
-            # Replace real storage with meta tensors (same shape, bf16) to avoid memory use
-                        for p in model.parameters():
-                # Preserve original dtype to avoid the incompatible‑type error
+            for p in model.parameters():
                 with torch.no_grad():
                     p.data = torch.empty_like(p.data, device="meta")
 
@@ -137,52 +130,44 @@ class ReversePipelineEngine:
             model.model.embed_tokens,
             *model.model.layers,
             model.lm_head,
-        ]: List[torch.nn.Module] = [
-            model.model.embed_tokens,
-            *model.model.layers,
-            model.lm_head,
         ]
 
-        # two flight buffers (double‑buffer)
+        # double‑buffer
         self.buffers = (_FlatPacket(), _FlatPacket())
         self.toggle = 0
 
-    # ---------------------------------------------------------------- helper P2P wrappers
+    # ------------------------------ ring helpers
 
-    def _ring_send(self, tensor: torch.Tensor, dst: int) -> None:
-        dist.send(tensor=tensor, dst=dst)
+    def _ring_send(self, tensor: torch.Tensor, dst: int):
+        dist.send(tensor, dst)
 
-    def _ring_recv(self, tensor: torch.Tensor, src: int) -> None:
-        dist.recv(tensor=tensor, src=src)
+    def _ring_recv(self, tensor: torch.Tensor, src: int):
+        dist.recv(tensor, src)
 
-    # ---------------------------------------------------------------- layer streaming primitive
+    # ------------------------------ layer streaming
 
-    def _stream_layer(self, idx: int) -> None:
+    def _stream_layer(self, idx: int):
         left = (self.rank - 1) % self.world
         right = (self.rank + 1) % self.world
-        buf_in = self.buffers[self.toggle]
+        buf = self.buffers[self.toggle]
 
-        # 1) receive or pack
         if not (self.rank == 0 and idx == 0):
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
-            self._ring_recv(shape, src=left)
-            buf_in.make_empty(int(shape.item()), self.device)
-            self._ring_recv(buf_in.flat, src=left)
+            self._ring_recv(shape, left)
+            buf.make_empty(int(shape.item()), self.device)
+            self._ring_recv(buf.flat, left)
         else:
-            buf_in.pack(self.layers[idx], self.device)  # rank‑0 kick‑off
+            buf.pack(self.layers[idx], self.device)
 
-        # 2) materialise on this rank
-        buf_in.unpack_to(self.layers[idx])
+        buf.unpack_to(self.layers[idx])
 
-        # 3) forward payload to the next rank
-        shape_out = torch.tensor([buf_in.flat.numel()], dtype=torch.int64, device=self.device)
-        self._ring_send(shape_out, dst=right)
-        self._ring_send(buf_in.flat, dst=right)
+        shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
+        self._ring_send(shape_out, right)
+        self._ring_send(buf.flat, right)
 
-        # switch buffers for next layer
-        self.toggle = 1 - self.toggle
+        self.toggle ^= 1  # swap buffers
 
-    # ---------------------------------------------------------------- forward & sample
+    # ------------------------------ forward & sample
 
     @torch.no_grad()
     def _forward_full(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -202,29 +187,30 @@ class ReversePipelineEngine:
         logits = self._forward_full(hidden)
         probs = torch.softmax(logits / self.args.sampling_temperature, dim=-1)
         draws = torch.multinomial(
-            probs.view(-1, probs.size(-1)), self.args.num_samples * self.args.num_rounds, replacement=True
+            probs.view(-1, probs.size(-1)),
+            self.args.num_samples * self.args.num_rounds,
+            replacement=True,
         ).view(*probs.shape[:-1], -1)
 
-        ids_all: List[List[List[int]]] = []
-        counts_all: List[List[List[int]]] = []
+        ids_all, counts_all = [], []
         for b in range(draws.size(0)):
-            ids_seq, cnts_seq = [], []
+            ids_seq, cnt_seq = [], []
             for t in range(draws.size(1)):
                 uniq, cnt = torch.unique(draws[b, t], return_counts=True)
                 ids_seq.append(uniq.cpu().tolist())
-                cnts_seq.append(cnt.cpu().tolist())
+                cnt_seq.append(cnt.cpu().tolist())
             ids_all.append(ids_seq)
-            counts_all.append(cnts_seq)
+            counts_all.append(cnt_seq)
         return ids_all, counts_all
 
 ###############################################################################
-#                    Data handling & Hub push                                #
+#                    Data utilities & HF push                                #
 ###############################################################################
 
 def collate_fn(examples, tok, max_len):
     return tok([e["text"] for e in examples], return_tensors="pt", padding=True, truncation=True, max_length=max_len)
 
-def streaming_loader(ds, tok, bs, max_len):
+def stream_loader(ds, tok, bs, max_len):
     buf = []
     for ex in ds:
         buf.append(ex)
@@ -236,16 +222,11 @@ def streaming_loader(ds, tok, bs, max_len):
 
 def push_shard(records: List[dict], args: Args):
     api = HfApi(token=args.hf_token)
-    files = api.list_repo_files(args.output_repo, repo_type="dataset")
-    idx = sum(f.endswith(".parquet") for f in files)
+    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
     fname = f"data_{idx:05d}.parquet"
     Dataset.from_list(records).to_parquet(fname)
     repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull()
-    repo.git_add(fname)
-    repo.git_commit(f"Add shard {idx}")
-    repo.git_push()
-    repo.git_clear()
+    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {idx}"); repo.git_push(); repo.git_clear()
     os.remove(fname)
 
 ###############################################################################
@@ -256,63 +237,11 @@ def _gather_and_push(local: List[dict], args: Args, rank: int, world: int):
     gathered = [None] * world if rank == 0 else None
     dist.gather_object(local, gathered, dst=0)
     if rank == 0:
-        merged: List[dict] = []
+        flat: List[dict] = []
         for part in gathered:  # type: ignore[arg-type]
-            merged.extend(part)
-        push_shard(merged, args)
+            flat.extend(part)
+        push_shard(flat, args)
 
 
 def worker(args: Args):
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-
-    stop_evt = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
-
-    engine = ReversePipelineEngine(args, rank, world)
-    tok = AutoTokenizer.from_pretrained(args.model_name)
-    ds = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True, token=args.hf_token)
-    loader = streaming_loader(ds, tok, args.batch_size, args.max_seq_len)
-
-    local_records: List[dict] = []
-    seen = 0
-    for batch in loader:
-        if stop_evt.is_set():
-            break
-        input_ids = batch["input_ids"].to(engine.device, non_blocking=True)
-        hidden = engine.layers[0].to(engine.device)(input_ids)  # embed is index‑0
-        ids, cnts = engine.sample(hidden)
-        for i in range(len(input_ids)):
-            toks = input_ids[i].tolist()
-            while toks and toks[-1] == 0:
-                toks.pop()
-            seq_len = len(toks)
-            local_records.append(
-                {
-                    "input_ids": toks,
-                    "sampled_ids": ids[i][:seq_len],
-                    "sampled_counts": cnts[i][:seq_len],
-                }
-            )
-        seen += len(input_ids)
-        if seen >= args.push_every:
-            _gather_and_push(local_records, args, rank, world)
-            local_records.clear(); seen = 0
-        if stop_evt.is_set():
-            break
-    if local_records and not stop_evt.is_set():
-        _gather_and_push(local_records, args, rank, world)
-
-    dist.destroy_process_group()
-
-###############################################################################
-#                                   Main                                     #
-###############################################################################
-
-def main():
-    worker(parse_args())
-
-
-if __name__ == "__main__":
-    main()
+    dist.init
