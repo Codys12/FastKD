@@ -108,44 +108,67 @@ def _recv_param(src: int, device: torch.device, tag: int) -> torch.Tensor:
 # Parameter‑pipeline engine
 # ────────────────────────────────────────────────────────────────────────────────
 class ParamPipe:
+    """Parameter pipeline that streams layer weights through GPUs."""
+
     def __init__(self, model_name: str):
         self.rank = dist.get_rank()
         self.world = dist.get_world_size()
         self.device = _dev(self.rank)
 
-        # Rank‑0 loads full model weights on CPU
+        # ------------------------------------------------------------------
+        # 1. Metadata (layer count, shapes, prototype block class)
+        # ------------------------------------------------------------------
+        cfg = AutoConfig.from_pretrained(model_name)
+        # Build a *tiny* dummy model (on CPU) to grab shapes & classes.
+        dummy = AutoModelForCausalLM.from_config(cfg)
+        self.embed_shape = tuple(dummy.model.embed_tokens.weight.shape)
+        self.lm_head_shape = tuple(dummy.lm_head.weight.shape)
+        self.embed_numel = int(torch.prod(torch.tensor(self.embed_shape)))
+        self.lm_head_numel = int(torch.prod(torch.tensor(self.lm_head_shape)))
+        self.block_proto = dummy.model.layers[0].__class__
+        self.block_cfg = dummy.model.layers[0].config
+        self.n_layers = len(dummy.model.layers) + 2  # +embed +lm_head
+        del dummy  # free CPU RAM
+
+        # Only rank‑0 needs the *real* pretrained weights (on CPU).
         if self.rank == 0:
-            cfg = AutoConfig.from_pretrained(model_name)
-            cfg.attn_implementation = "eager"  # safer on CPU
-            self.model = AutoModelForCausalLM.from_pretrained(
+            pretrained = AutoModelForCausalLM.from_pretrained(
                 model_name, config=cfg, torch_dtype=torch.bfloat16, device_map={"": "cpu"}
             )
-            self.layers = [self.model.model.embed_tokens, *self.model.model.layers, self.model.lm_head]
+            self.full_layers = [
+                pretrained.model.embed_tokens,
+                *pretrained.model.layers,
+                pretrained.lm_head,
+            ]
         else:
-            self.model = None  # type: ignore
-            self.layers = None  # will be broadcast later
+            self.full_layers = None
 
-        # Share #layers to everybody
-        n_layers = torch.tensor([len(self.layers) if self.rank == 0 else 0], dtype=torch.long)
-        dist.broadcast(n_layers, src=0)
-        self.n_layers = int(n_layers.item())
-
-        # Double buffers
-        self.buffers = [None, None]  # type: List[torch.Tensor | None]
+        # Double buffers for vectors
+        self.buffers = [None, None]  # type: list[torch.Tensor | None]
         if self.device.type == "cuda":
             self.comp_stream = torch.cuda.Stream(device=self.device)
-            self.copy_stream = torch.cuda.Stream(device=self.device)
         else:
-            self.comp_stream = self.copy_stream = torch.cuda.current_stream()
+            self.comp_stream = torch.cuda.current_stream()
 
-        # Prototype layer instances (avoids class rebuild every pass)
-        if self.rank == 0:
-            self.block_proto = self.model.model.layers[0].__class__  # type: ignore
-            self.block_cfg = self.model.model.layers[0].config  # type: ignore
-        else:
-            self.block_proto = self.block_cfg = None  # will come over broadcast if needed
+    # ------------------------------------------------------------------
+    # Helpers for send/recv parameter vectors (GPU tensors for NCCL)
+    # ------------------------------------------------------------------
+    def _send_param(self, vec: torch.Tensor, dst: int, tag: int):
+        meta = torch.tensor([vec.numel(), _DTYPE2CODE[vec.dtype]], dtype=torch.long, device=vec.device)
+        dist.send(meta, dst=dst, tag=tag + 999)
+        dist.isend(vec, dst=dst, tag=tag)
 
-    # ---------------------------------------------------------------------
+    def _recv_param(self, src: int, tag: int) -> torch.Tensor:
+        meta = torch.empty(2, dtype=torch.long, device=self.device)
+        dist.recv(meta, src=src, tag=tag + 999)
+        numel, code = meta.tolist()
+        out = torch.empty(numel, dtype=_CODE2DTYPE[code], device=self.device)
+        dist.recv(out, src=src, tag=tag)
+        return out
+
+    # ------------------------------------------------------------------
+    # Forward pass + sampling
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def run(
         self,
@@ -154,8 +177,8 @@ class ParamPipe:
         N: int,
         R: int,
         temp: float,
-    ) -> Tuple[List[List[List[int]]], List[List[List[int]]]]:
-        """Execute one forward + sampling (sampling only rank‑0)."""
+    ) -> Tuple[list[list[list[int]]], list[list[list[int]]]]:
+        """Streams layer weights through ranks; rank‑0 returns samples."""
         input_ids = input_ids.to(self.device, non_blocking=True)
         hidden = None
 
@@ -163,30 +186,36 @@ class ParamPipe:
         prev_rank = self.rank - 1 if self.rank > 0 else -1
 
         for idx in range(self.n_layers):
-            tag = idx & 1  # ping‑pong
-            # ─ receive parameters (except rank‑0 embed handled locally) ──
-            if not (self.rank == 0 and idx == 0):
-                self.buffers[tag] = _recv_param(prev_rank, self.device, tag)
-            else:  # rank‑0 embed
-                self.buffers[tag] = self._vec_layer(self.layers[idx]).to(self.device, non_blocking=True)
+            tag = idx & 1
+            # ──────────────────────────────────────────────────────────
+            # 1. LOAD / RECEIVE vector for current layer
+            # ──────────────────────────────────────────────────────────
+            if self.rank == 0:
+                vec_cpu = self._vec_layer(self.full_layers[idx])  # type: ignore[arg-type]
+                vec = vec_cpu.to(self.device, non_blocking=True)
+            else:
+                vec = self._recv_param(prev_rank, tag)
+            self.buffers[tag] = vec
 
-            # ─ send params downstream asynchronously ──
+            # Forward vector downstream (unless last GPU)
             if next_rank != -1:
-                _send_param(self.buffers[tag], next_rank, tag)
+                self._send_param(vec, next_rank, tag)
 
-            # ─ compute with **previous** buffer (double‑buffering) ──
+            # ──────────────────────────────────────────────────────────
+            # 2. COMPUTE with previous buffer (double‑buffer)
+            # ──────────────────────────────────────────────────────────
             prev_tag = tag ^ 1
             if self.buffers[prev_tag] is not None:
                 with torch.cuda.stream(self.comp_stream):
                     hidden = self._apply(prev_tag, hidden, input_ids, micro_bs)
-            # sync so hidden ready before next iter
-            torch.cuda.current_stream().wait_stream(self.comp_stream)
+                torch.cuda.current_stream().wait_stream(self.comp_stream)
 
-        # After last real layer, process lm_head (already in buffers[tag])
-        with torch.cuda.stream(self.comp_stream):
-            hidden = self._apply(tag, hidden, input_ids, micro_bs)
-        torch.cuda.current_stream().wait_stream(self.comp_stream)
+        # Process the last buffered layer
+        hidden = self._apply(tag, hidden, input_ids, micro_bs)
 
+        # ──────────────────────────────────────────────────────────
+        # 3. Sampling (rank‑0 only)
+        # ──────────────────────────────────────────────────────────
         if self.rank == 0:
             return self._sample(hidden, N, R, temp)
         return [], []
@@ -195,87 +224,39 @@ class ParamPipe:
     def _vec_layer(self, layer: torch.nn.Module) -> torch.Tensor:
         return torch.nn.utils.parameters_to_vector(list(layer.parameters())).contiguous()
 
-    def _apply(
-        self,
-        buf_tag: int,
-        hidden: torch.Tensor | None,
-        input_ids: torch.Tensor,
-        mbs: int,
-    ) -> torch.Tensor:
+    def _apply(self, buf_tag: int, hidden, input_ids, mbs):
         vec = self.buffers[buf_tag]
-        assert vec is not None
-        # Determine layer type by size comparison (cheap & safe under fixed arch)
-        if hidden is None:  # embedding layer
-            weight = vec.view_as(self.layers[0].weight)  # type: ignore
-            out = torch.nn.functional.embedding(input_ids, weight)
-            return out
-        elif vec.numel() == self.layers[-1].weight.numel():  # lm_head
-            W = vec.view_as(self.layers[-1].weight)  # type: ignore
-            logits = torch.matmul(hidden, W.t())
-            return logits
+        if vec is None:
+            return hidden
+        if hidden is None:  # embedding
+            weight = vec.view(self.embed_shape)
+            return torch.nn.functional.embedding(input_ids, weight)
+        elif vec.numel() == self.lm_head_numel:  # lm_head
+            W = vec.view(self.lm_head_shape)
+            return torch.matmul(hidden, W.t())
         else:  # transformer block
-            block: torch.nn.Module = self.block_proto(self.block_cfg).to(self.device)  # type: ignore
+            block = self.block_proto(self.block_cfg).to(self.device)
             torch.nn.utils.vector_to_parameters(vec, list(block.parameters()))
-            outs = []
-            for mb in hidden.split(mbs, dim=0):
-                outs.append(block(mb)[0])  # block returns tuple
+            outs = [block(mb)[0] for mb in hidden.split(mbs, dim=0)]
             return torch.cat(outs, dim=0)
 
     # ------------------------------------------------------------------
     @staticmethod
     @torch.no_grad()
-    def _sample(logits: torch.Tensor, N: int, R: int, t: float):
+    def _sample(logits, N, R, t):
         b, l, v = logits.shape
         p = torch.softmax(logits / t, dim=-1)
         draws = N * R
-        samples = torch.multinomial(p.view(-1, v), draws, replacement=True)
-        ids, counts = torch.unique(samples, return_counts=True)
-        # Broadcast identical ids/counts for every position to match API
-        ids = [[ids.tolist() for _ in range(l)] for _ in range(b)]
-        counts = [[counts.tolist() for _ in range(l)] for _ in range(b)]
-        return ids, counts
+        smp = torch.multinomial(p.view(-1, v), draws, replacement=True)
+        ids, cnt = torch.unique(smp, return_counts=True)
+        ids = [[ids.tolist()] * l for _ in range(b)]
+        cnt = [[cnt.tolist()] * l for _ in range(b)]
+        return ids, cnt
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Data helpers (unchanged)
+# Main (only small edits: n_layers broadcast removed)
 # ────────────────────────────────────────────────────────────────────────────────
-
-def _collate(batch, tok, max_len):
-    texts = [ex["text"] for ex in batch]
-    return tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_len)
-
-
-def _stream_loader(ds, tok, bs, max_len):
-    buf = []
-    for ex in ds:
-        buf.append(ex)
-        if len(buf) == bs:
-            yield _collate(buf, tok, max_len)
-            buf.clear()
-    if buf:
-        yield _collate(buf, tok, max_len)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Hub push helper (same as before)
-# ────────────────────────────────────────────────────────────────────────────────
-
-def _push(records: List[dict], args: Args):
-    api = HfApi(token=args.hf_token)
-    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
-    fname = f"data_{idx:05d}.parquet"
-    Dataset.from_list(records).to_parquet(fname)
-    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull()
-    repo.git_add(fname)
-    repo.git_commit(f"Add shard {idx}")
-    repo.git_push()
-    repo.git_clear()
-    os.remove(fname)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────────────────────────────────────
-
-def main():
+):
     args = _parse()
 
     dist.init_process_group("nccl")  # torchrun sets env vars
