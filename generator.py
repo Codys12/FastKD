@@ -2,15 +2,21 @@ from __future__ import annotations
 
 """
 Generator with **reverse pipeline parallelism** using NCCL peer‑to‑peer.
-Parameters travel in a ring  CPU → GPU‑0 → GPU‑1 → … → GPU‑(N−1) → **GPU‑0**
-(where rank‑0 off‑loads back to CPU after the final hop). All tensors used in
-`dist.send/recv` are **CUDA** so the NCCL backend is valid.
+Parameters circulate in a ring  CPU → GPU‑0 → GPU‑1 → … → GPU‑(N−1) → GPU‑0  
+Rank‑0 immediately off‑loads the final hop back to CPU so memory pressure on
+GPU‑0 stays bounded.
 
-This version fixes the runtime error «No backend type associated with device
-type cpu» by ensuring that every tensor passed to NCCL lives on a CUDA device.
+Key implementation points
+-------------------------
+* **CUDA tensors only** in `dist.send/recv` ➟ avoids the «No backend type associated
+  with device type cpu» error.
+* **Skeleton weights on non‑zero ranks** are initialised as *meta* tensors with
+  the same *shape* and **bfloat16** dtype; real parameters arrive via the ring.
+* **Double‑buffering** hides latency: while one buffer is used for compute, the
+  other is in flight to the next rank.
+* **Vectorised multinomial**: sampling is a single GPU call—no Python loops.
 
-Double‑buffering still overlaps transfer / compute. Sampling is vectorised.
-The launch command from your SLURM script remains unchanged.
+The script still matches your SLURM launch line verbatim.
 """
 
 import argparse
@@ -67,10 +73,15 @@ def parse_args() -> Args:
 ###############################################################################
 
 class _FlatPacket:
+    """Simple container that flattens parameters for efficient P2P transfer."""
+
     def __init__(self):
-        self.flat: torch.Tensor | None = None  # CUDA tensor when active
+        self.flat: torch.Tensor | None = None  # always CUDA when populated
+
+    # ---------------------------------------------------------------- pack/unpack
 
     def pack(self, layer: torch.nn.Module, device: torch.device) -> None:
+        """Flatten `layer` params into a single contiguous CUDA tensor."""
         with torch.no_grad():
             vec = [p.data.view(-1) for p in layer.parameters()]
             self.flat = torch.cat(vec).contiguous().to(device, non_blocking=True)
@@ -80,7 +91,7 @@ class _FlatPacket:
 
     def unpack_to(self, layer: torch.nn.Module) -> None:
         if self.flat is None:
-            raise RuntimeError("attempt to unpack empty packet")
+            raise RuntimeError("_FlatPacket is empty — cannot unpack")
         offset = 0
         with torch.no_grad():
             for p in layer.parameters():
@@ -93,7 +104,7 @@ class _FlatPacket:
 ###############################################################################
 
 class ReversePipelineEngine:
-    """Stream *layers* through resident hidden‑states on each GPU."""
+    """Streams *layers* through static hidden‑states in a ring topology."""
 
     def __init__(self, args: Args, rank: int, world: int):
         self.args = args
@@ -102,40 +113,36 @@ class ReversePipelineEngine:
         self.device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(self.device)
 
-        # Build model skeleton on every rank (meta params to save memory)
-        base_cfg = AutoConfig.from_pretrained(args.model_name)
-        base_cfg.attn_implementation = "eager"  # Later we flip to flash_attention_2
+        # ---------------------------------------------------------------- model skeleton
+        cfg = AutoConfig.from_pretrained(args.model_name)
+        cfg.attn_implementation = "eager"  # safe on CPU
+
         if rank == 0:
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_name,
-                config=base_cfg,
+                config=cfg,
                 device_map={"": "cpu"},
                 torch_dtype=torch.bfloat16,
             )
             model.config.attn_implementation = "flash_attention_2"
         else:
-            model = AutoModelForCausalLM.from_config(base_cfg)
-                        # Lightweight skeleton: immediately convert params to **meta** with same shape/dtype so
-            # we keep structural information but allocate no real memory.
+            model = AutoModelForCausalLM.from_config(cfg)
+            # Replace real storage with meta tensors (same shape, bf16) to avoid memory use
             for p in model.parameters():
                 with torch.no_grad():
-                    p.data = torch.empty_like(p.data, device="meta")
+                    p.data = torch.empty_like(p.data, dtype=torch.bfloat16, device="meta")
 
         self.layers: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
             model.lm_head,
-        ]: List[torch.nn.Module] = [
-            model.model.embed_tokens,
-            *model.model.layers,
-            model.lm_head,
         ]
 
-        # Double buffers for weight flighting
+        # two flight buffers (double‑buffer)
         self.buffers = (_FlatPacket(), _FlatPacket())
         self.toggle = 0
 
-    # ------------------------------------------------------------------ utils
+    # ---------------------------------------------------------------- helper P2P wrappers
 
     def _ring_send(self, tensor: torch.Tensor, dst: int) -> None:
         dist.send(tensor=tensor, dst=dst)
@@ -143,53 +150,47 @@ class ReversePipelineEngine:
     def _ring_recv(self, tensor: torch.Tensor, src: int) -> None:
         dist.recv(tensor=tensor, src=src)
 
-    # ---------------------------------------------------------------- pipeline
+    # ---------------------------------------------------------------- layer streaming primitive
 
     def _stream_layer(self, idx: int) -> None:
-        """Move *one* layer along the ring; double‑buffered."""
         left = (self.rank - 1) % self.world
         right = (self.rank + 1) % self.world
-
         buf_in = self.buffers[self.toggle]
-        buf_out = self.buffers[1 - self.toggle]
 
-        # 1. Receive parameters from left neighbour (except rank‑0 first hop)
+        # 1) receive or pack
         if not (self.rank == 0 and idx == 0):
-            shape_gpu = torch.empty(1, dtype=torch.int64, device=self.device)
-            self._ring_recv(shape_gpu, src=left)
-            numel = int(shape_gpu.item())
-            buf_in.make_empty(numel, self.device)
+            shape = torch.empty(1, dtype=torch.int64, device=self.device)
+            self._ring_recv(shape, src=left)
+            buf_in.make_empty(int(shape.item()), self.device)
             self._ring_recv(buf_in.flat, src=left)
         else:
-            # Rank‑0 packs first layer
-            buf_in.pack(self.layers[idx], self.device)
+            buf_in.pack(self.layers[idx], self.device)  # rank‑0 kick‑off
 
-        # 2. Materialise layer on this rank
+        # 2) materialise on this rank
         buf_in.unpack_to(self.layers[idx])
 
-        # 3. Send to right neighbour (rank‑0 still sends, including last GPU → 0)
-        shape_gpu = torch.tensor([buf_in.flat.numel()], dtype=torch.int64, device=self.device)
-        self._ring_send(shape_gpu, dst=right)
+        # 3) forward payload to the next rank
+        shape_out = torch.tensor([buf_in.flat.numel()], dtype=torch.int64, device=self.device)
+        self._ring_send(shape_out, dst=right)
         self._ring_send(buf_in.flat, dst=right)
 
-        self.toggle = 1 - self.toggle  # swap buffers
+        # switch buffers for next layer
+        self.toggle = 1 - self.toggle
 
-    # ---------------------------------------------------- forward + sampling
+    # ---------------------------------------------------------------- forward & sample
 
     @torch.no_grad()
     def _forward_full(self, hidden: torch.Tensor) -> torch.Tensor:
-        for i in range(len(self.layers)):
-            self._stream_layer(i)
-            layer = self.layers[i].to(self.device, non_blocking=True)
+        for idx in range(len(self.layers)):
+            self._stream_layer(idx)
+            layer = self.layers[idx].to(self.device, non_blocking=True)
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
                 mb = hidden[start : start + self.args.micro_batch_size]
                 out = layer(mb)
-                if isinstance(out, tuple):
-                    out = out[0]
-                hidden[start : start + self.args.micro_batch_size] = out
+                hidden[start : start + self.args.micro_batch_size] = out[0] if isinstance(out, tuple) else out
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
-        return hidden  # logits after lm_head
+        return hidden  # logits
 
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor) -> Tuple[List[List[List[int]]], List[List[List[int]]]]:
@@ -202,31 +203,31 @@ class ReversePipelineEngine:
         ids_all: List[List[List[int]]] = []
         counts_all: List[List[List[int]]] = []
         for b in range(draws.size(0)):
-            ids_seq, counts_seq = [], []
+            ids_seq, cnts_seq = [], []
             for t in range(draws.size(1)):
                 uniq, cnt = torch.unique(draws[b, t], return_counts=True)
                 ids_seq.append(uniq.cpu().tolist())
-                counts_seq.append(cnt.cpu().tolist())
+                cnts_seq.append(cnt.cpu().tolist())
             ids_all.append(ids_seq)
-            counts_all.append(counts_seq)
+            counts_all.append(cnts_seq)
         return ids_all, counts_all
 
 ###############################################################################
-#                    Data handling & HF push                                 #
+#                    Data handling & Hub push                                #
 ###############################################################################
 
 def collate_fn(examples, tok, max_len):
     return tok([e["text"] for e in examples], return_tensors="pt", padding=True, truncation=True, max_length=max_len)
 
 def streaming_loader(ds, tok, bs, max_len):
-    batch = []
+    buf = []
     for ex in ds:
-        batch.append(ex)
-        if len(batch) == bs:
-            yield collate_fn(batch, tok, max_len)
-            batch.clear()
-    if batch:
-        yield collate_fn(batch, tok, max_len)
+        buf.append(ex)
+        if len(buf) == bs:
+            yield collate_fn(buf, tok, max_len)
+            buf.clear()
+    if buf:
+        yield collate_fn(buf, tok, max_len)
 
 def push_shard(records: List[dict], args: Args):
     api = HfApi(token=args.hf_token)
@@ -246,12 +247,12 @@ def push_shard(records: List[dict], args: Args):
 #                                   Worker                                   #
 ###############################################################################
 
-def _gather_and_push(local_records: List[dict], args: Args, rank: int, world: int):
+def _gather_and_push(local: List[dict], args: Args, rank: int, world: int):
     gathered = [None] * world if rank == 0 else None
-    dist.gather_object(local_records, gathered, dst=0)
+    dist.gather_object(local, gathered, dst=0)
     if rank == 0:
         merged: List[dict] = []
-        for part in gathered:  # type: ignore[assignment]
+        for part in gathered:  # type: ignore[arg-type]
             merged.extend(part)
         push_shard(merged, args)
 
@@ -261,8 +262,8 @@ def worker(args: Args):
     rank = dist.get_rank()
     world = dist.get_world_size()
 
-    stop_event = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    stop_evt = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
 
     engine = ReversePipelineEngine(args, rank, world)
     tok = AutoTokenizer.from_pretrained(args.model_name)
@@ -272,38 +273,41 @@ def worker(args: Args):
     local_records: List[dict] = []
     seen = 0
     for batch in loader:
-        if stop_event.is_set():
+        if stop_evt.is_set():
             break
         input_ids = batch["input_ids"].to(engine.device, non_blocking=True)
-        hidden = engine.layers[0].to(engine.device)(input_ids)  # embed layer stays resident
-        ids, counts = engine.sample(hidden)
+        hidden = engine.layers[0].to(engine.device)(input_ids)  # embed is index‑0
+        ids, cnts = engine.sample(hidden)
         for i in range(len(input_ids)):
             toks = input_ids[i].tolist()
             while toks and toks[-1] == 0:
                 toks.pop()
             seq_len = len(toks)
-            local_records.append({
-                "input_ids": toks,
-                "sampled_ids": ids[i][:seq_len],
-                "sampled_counts": counts[i][:seq_len],
-            })
+            local_records.append(
+                {
+                    "input_ids": toks,
+                    "sampled_ids": ids[i][:seq_len],
+                    "sampled_counts": cnts[i][:seq_len],
+                }
+            )
         seen += len(input_ids)
         if seen >= args.push_every:
             _gather_and_push(local_records, args, rank, world)
             local_records.clear(); seen = 0
-        if stop_event.is_set():
+        if stop_evt.is_set():
             break
-    if local_records and not stop_event.is_set():
+    if local_records and not stop_evt.is_set():
         _gather_and_push(local_records, args, rank, world)
 
     dist.destroy_process_group()
 
 ###############################################################################
-#                                   main                                     #
+#                                   Main                                     #
 ###############################################################################
 
 def main():
     worker(parse_args())
+
 
 if __name__ == "__main__":
     main()
