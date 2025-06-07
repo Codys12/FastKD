@@ -2,10 +2,13 @@ from __future__ import annotations
 
 """
 Generator with **reverse pipeline parallelism** (ring) + verbose DEBUG logs.
-Params circulate CPU → GPU-0 → … → GPU-N-1 → GPU-0 (then rank-0 drops to CPU).
+Parameters circulate in a ring  CPU → GPU‑0 → … → GPU‑N‑1 → GPU‑0 (rank‑0 then
+moves weights back to CPU).  Add `--debug` to print *very* chatty per‑rank
+information; otherwise only high‑level milestones are shown.
 
-Pass `--debug` to enable very chatty per-rank prints, otherwise only coarse
-progress is reported.
+This version fixes the previous **SyntaxError** (duplicate `self.layers` block)
+and relies on `accelerate.init_empty_weights` to build the empty parameter
+skeleton on non‑zero ranks, avoiding incompatible tensor‑type issues.
 """
 
 import argparse
@@ -45,7 +48,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Reverse-pipeline KD generator (ring)")
+    p = argparse.ArgumentParser("Reverse‑pipeline KD generator (ring)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -62,7 +65,7 @@ def parse_args() -> Args:
     return Args(**vars(p.parse_args()))
 
 ###############################################################################
-#                           Helper: debug printer                             #
+#                             Helper: debug printer                           #
 ###############################################################################
 
 def get_logger(rank: int, enabled: bool):
@@ -76,7 +79,7 @@ def get_logger(rank: int, enabled: bool):
 ###############################################################################
 
 class _FlatPacket:
-    """Flatten parameters into a contiguous CUDA tensor for fast P2P."""
+    """Flatten parameters into a contiguous CUDA tensor for fast P2P transfer."""
 
     def __init__(self):
         self.flat: torch.Tensor | None = None
@@ -100,11 +103,11 @@ class _FlatPacket:
                 offset += n
 
 ###############################################################################
-#                    Reverse pipeline engine (ring)                           #
+#                       Reverse pipeline engine (ring)                        #
 ###############################################################################
 
 class ReversePipelineEngine:
-    """Stream *layers* through static hidden-states on each GPU."""
+    """Stream *layers* through static hidden‑states resident on each GPU."""
 
     def __init__(self, args: Args, rank: int, world: int, dbg):
         self.args = args
@@ -115,7 +118,7 @@ class ReversePipelineEngine:
         self.dbg = dbg
 
         cfg = AutoConfig.from_pretrained(args.model_name)
-        cfg.attn_implementation = "eager"
+        cfg.attn_implementation = "eager"  # safe for CPU init
 
         if rank == 0:
             dbg("Loading full model on CPU…")
@@ -127,12 +130,14 @@ class ReversePipelineEngine:
             )
             model.config.attn_implementation = "flash_attention_2"
         else:
-            dbg("Building meta skeleton…")
-            model = AutoModelForCausalLM.from_config(cfg)
-            # --- FIX: move parameters to meta safely ---
-            model.to_empty(device="meta", dtype=torch.bfloat16)
-            model.config.attn_implementation = "flash_attention_2"
+            dbg("Building empty‑weight skeleton (meta)…")
+            # Robust meta‑initialisation compatible with accelerate>=0.26
+            from accelerate.utils import init_empty_weights
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(cfg)
 
+
+        # ---------- single, correct layers list (no duplicates!) ----------
         self.layers: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
@@ -143,7 +148,7 @@ class ReversePipelineEngine:
         self.buffers = (_FlatPacket(), _FlatPacket())
         self.toggle = 0
 
-    # ------------------------------ ring helpers
+    # ------------------------------ ring helpers -------------------------
 
     def _ring_send(self, tensor: torch.Tensor, dst: int):
         self.dbg(f"send → {dst}, numel={tensor.numel()}")
@@ -153,7 +158,7 @@ class ReversePipelineEngine:
         self.dbg(f"recv ← {src}, expect numel={tensor.numel()}")
         dist.recv(tensor, src)
 
-    # ------------------------------ layer streaming
+    # ------------------------------ layer streaming ----------------------
 
     def _stream_layer(self, idx: int):
         left = (self.rank - 1) % self.world
@@ -168,7 +173,7 @@ class ReversePipelineEngine:
         else:
             buf.pack(self.layers[idx], self.device)
 
-        buf.unpack_to(self.layers[idx])
+        buf.unpack_to(self.layers[idx])  # materialise on this GPU
 
         shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
         self._ring_send(shape_out, right)
@@ -176,7 +181,7 @@ class ReversePipelineEngine:
 
         self.toggle ^= 1
 
-    # ------------------------------ forward & sample
+    # ------------------------------ forward & sample ---------------------
 
     @torch.no_grad()
     def _forward_full(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -191,7 +196,7 @@ class ReversePipelineEngine:
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
             self.dbg(f"Layer {idx} done")
-        return hidden
+        return hidden  # logits
 
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor):
@@ -215,7 +220,7 @@ class ReversePipelineEngine:
         return ids_all, counts_all
 
 ###############################################################################
-#                    Data utilities & HF push                                #
+#                    Data utilities & Hub push                               #
 ###############################################################################
 
 def collate_fn(examples, tok, max_len):
@@ -246,6 +251,7 @@ def push_shard(records: List[dict], args: Args, dbg):
 ###############################################################################
 
 def _gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
+    """Gather python‑object shards to rank‑0 and push a single parquet file."""
     gathered = [None] * world if rank == 0 else None
     dist.gather_object(local, gathered, dst=0)
     if rank == 0:
@@ -256,53 +262,65 @@ def _gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
 
 
 def worker(args: Args):
-    # Distributed init
+    """Main per‑process loop: init dist, stream data, sample, push."""
+    # ---------------- init ----------------
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world = dist.get_world_size()
     dbg = get_logger(rank, args.debug)
 
-    dbg("Process started, setting handlers…")
     stop_evt = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
 
     try:
         engine = ReversePipelineEngine(args, rank, world, dbg)
         tok = AutoTokenizer.from_pretrained(args.model_name)
-        ds = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True, token=args.hf_token)
+        ds = load_dataset(
+            args.dataset_name,
+            split=args.dataset_split,
+            streaming=True,
+            token=args.hf_token,
+        )
         loader = stream_loader(ds, tok, args.batch_size, args.max_seq_len)
 
         local_records: List[dict] = []
         seen = 0
-        for i, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
             if stop_evt.is_set():
-                dbg("SIGTERM received, exiting loop")
+                dbg("SIGTERM received; breaking loop")
                 break
-            dbg(f"Batch {i} acquired")
+
+            dbg(f"Batch {batch_idx} acquired")
             input_ids = batch["input_ids"].to(engine.device, non_blocking=True)
-            hidden = engine.layers[0].to(engine.device)(input_ids)
+            hidden = engine.layers[0].to(engine.device)(input_ids)  # embed once
             ids, cnts = engine.sample(hidden)
-            for j in range(len(input_ids)):
-                toks = input_ids[j].tolist()
+
+            for i in range(len(input_ids)):
+                toks = input_ids[i].tolist()
                 while toks and toks[-1] == 0:
                     toks.pop()
                 seq_len = len(toks)
-                local_records.append({
-                    "input_ids": toks,
-                    "sampled_ids": ids[j][:seq_len],
-                    "sampled_counts": cnts[j][:seq_len],
-                })
+                local_records.append(
+                    {
+                        "input_ids": toks,
+                        "sampled_ids": ids[i][:seq_len],
+                        "sampled_counts": cnts[i][:seq_len],
+                    }
+                )
             seen += len(input_ids)
+
             if seen >= args.push_every:
+                dbg("Local push_every reached; gathering to rank‑0 …")
                 _gather_and_push(local_records, args, rank, world, dbg)
                 local_records.clear(); seen = 0
-            dbg(f"Batch {i} done, total local records {len(local_records)}")
-            if stop_evt.is_set():
-                break
+
+        # final flush
         if local_records and not stop_evt.is_set():
+            dbg("Final flush …")
             _gather_and_push(local_records, args, rank, world, dbg)
-    except Exception as e:
-        dbg("Exception occurred! Printing traceback…")
+
+    except Exception:
+        dbg("Exception occurred! Printing traceback …")
         traceback.print_exc()
         dist.destroy_process_group()
         sys.exit(1)
@@ -310,8 +328,9 @@ def worker(args: Args):
     dbg("Graceful shutdown")
     dist.destroy_process_group()
 
+
 ###############################################################################
-#                                   Main                                     #
+#                                   Entry                                    #
 ###############################################################################
 
 def main():
