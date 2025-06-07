@@ -128,11 +128,16 @@ class ReversePipelineEngine:
         else:
             model = AutoModelForCausalLM.from_config(cfg)
             # Replace real storage with meta tensors (same shape, bf16) to avoid memory use
-            for p in model.parameters():
+                        for p in model.parameters():
+                # Preserve original dtype to avoid the incompatible‑type error
                 with torch.no_grad():
-                    p.data = torch.empty_like(p.data, dtype=torch.bfloat16, device="meta")
+                    p.data = torch.empty_like(p.data, device="meta")
 
         self.layers: List[torch.nn.Module] = [
+            model.model.embed_tokens,
+            *model.model.layers,
+            model.lm_head,
+        ]: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
             model.lm_head,
