@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """
 Generator with **reverse pipeline parallelism** (ring) + verbose DEBUG logs.
-Params circulate CPU → GPU‑0 → … → GPU‑N‑1 → GPU‑0 (then rank‑0 drops to CPU).
+Params circulate CPU → GPU-0 → … → GPU-N-1 → GPU-0 (then rank-0 drops to CPU).
 
-Pass `--debug` to enable very chatty per‑rank prints, otherwise only coarse
+Pass `--debug` to enable very chatty per-rank prints, otherwise only coarse
 progress is reported.
 """
 
@@ -45,7 +45,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Reverse‑pipeline KD generator (ring)")
+    p = argparse.ArgumentParser("Reverse-pipeline KD generator (ring)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -104,7 +104,7 @@ class _FlatPacket:
 ###############################################################################
 
 class ReversePipelineEngine:
-    """Stream *layers* through static hidden‑states on each GPU."""
+    """Stream *layers* through static hidden-states on each GPU."""
 
     def __init__(self, args: Args, rank: int, world: int, dbg):
         self.args = args
@@ -129,9 +129,9 @@ class ReversePipelineEngine:
         else:
             dbg("Building meta skeleton…")
             model = AutoModelForCausalLM.from_config(cfg)
-            for p in model.parameters():
-                with torch.no_grad():
-                    p.data = torch.empty_like(p.data, device="meta")
+            # --- FIX: move parameters to meta safely ---
+            model.to_empty(device="meta", dtype=torch.bfloat16)
+            model.config.attn_implementation = "flash_attention_2"
 
         self.layers: List[torch.nn.Module] = [
             model.model.embed_tokens,
