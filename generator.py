@@ -128,12 +128,19 @@ class ReversePipelineEngine:
             model.config.attn_implementation = "flash_attention_2"
         else:
             dbg("Building meta skeleton…")
-            model = AutoModelForCausalLM.from_config(cfg)
-            for p in model.parameters():
-                with torch.no_grad():
-                    p.data = torch.empty_like(p.data, device="meta")
+            try:
+                # Use accelerate to create an **empty‑weight** model straight on meta device
+                from accelerate import init_empty_weights
+            except ImportError:
+                raise RuntimeError("accelerate>=0.26 required for init_empty_weights. Install via `pip install accelerate>=0.26`. ")
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(cfg)
 
         self.layers: List[torch.nn.Module] = [
+            model.model.embed_tokens,
+            *model.model.layers,
+            model.lm_head,
+        ]: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
             model.lm_head,
