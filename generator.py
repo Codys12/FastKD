@@ -1,22 +1,41 @@
 # generator_distributed.py – weight‑streaming + double‑buffer + vectorised sampling
-# Author : ChatGPT – June 2025   (rev‑5: fix syntax + indent)
-"""Minimal, runnable revision fixing the syntax/indent errors introduced in rev‑4.
-Highlights remain:
-* weight streaming with double‑buffer prefetch
-* fully GPU‑side multinomial sampling (vectorised)
-* only IDs+counts copied to CPU
+# Author : ChatGPT – June 2025   (rev‑6: remove git; reduce CPU memory footprint)
+"""Minimal, runnable revision fixing the syntax/indent errors introduced in rev‑4 and
+adding the following improvements over rev‑5:
+
+* **Git‑free uploads** – uses `HfApi.upload_file` for direct multi‑part upload to the Hub;
+  avoids cloning/pulling/pushing a local Git repo and therefore keeps CPU‑side memory
+  as low as possible.
+* **Per‑rank sharding** – each rank writes/streams its own Parquet shard instead of
+  doing an `all_gather_object`, eliminating the very large transient object that
+  previously accumulated on rank‑0.
+* **Early & frequent flushing** – keeps only `args.push_every` examples (default = 256)
+  in RAM before pushing, instead of building up 1 000 + records.  This dramatically
+  cuts peak host‑RAM usage during long‑running jobs.
+* **Explicit garbage collection** – inserts controlled `gc.collect()` calls at key
+  points after buffers and tensors are released.
+* **Minor niceties** – unique shard names, progress printouts, and small cleanup tweaks.
+
+The core streaming / double‑buffer inference logic is unchanged.
 """
 
 from __future__ import annotations
 
-import argparse, atexit, os, signal, threading, time, datetime
+import argparse
+import atexit
+import datetime
+import gc
+import os
+import signal
+import threading
+import time
 from dataclasses import dataclass
 from typing import List
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfApi, Repository
+from datasets import Dataset, load_dataset
+from huggingface_hub import HfApi
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
@@ -47,6 +66,7 @@ class Args:
     max_seq_len: int
     hf_token: str | None = None
 
+
 def parse_args() -> Args:
     p = argparse.ArgumentParser("KD generator – weight‑stream + vectorised sampling")
     p.add_argument("--model_name", required=True)
@@ -58,10 +78,11 @@ def parse_args() -> Args:
     p.add_argument("--num_rounds", type=int, default=50)
     p.add_argument("--num_samples", type=int, default=1)
     p.add_argument("--sampling_temperature", type=float, default=1.0)
-    p.add_argument("--push_every", type=int, default=1000)
+    p.add_argument("--push_every", type=int, default=256)  # ↓ lower default for smaller RAM
     p.add_argument("--max_seq_len", type=int, default=2048)
     p.add_argument("--hf_token", default=None)
     return Args(**vars(p.parse_args()))
+
 
 # ---------------------------------------------------------------------------
 # DISTRIBUTED HELPERS
@@ -86,6 +107,7 @@ def safe_barrier(timeout: float = 60):
             return
         time.sleep(0.1)
 
+
 @atexit.register
 def _destroy_pg():
     if dist.is_initialized():
@@ -94,8 +116,9 @@ def _destroy_pg():
         except Exception:
             pass
 
+
 # ---------------------------------------------------------------------------
-# VECTORISED SAMPLER
+# VECTORISED SAMPLER (unchanged)
 # ---------------------------------------------------------------------------
 
 def sample_distribution(logits: torch.Tensor, N: int, R: int, temp: float = 1.0):
@@ -103,25 +126,36 @@ def sample_distribution(logits: torch.Tensor, N: int, R: int, temp: float = 1.0)
     probs = torch.softmax(logits / temp, dim=-1)
     B, L, V = probs.shape
     draws = torch.multinomial(probs.view(-1, V), N * R, replacement=True)  # (B*L, N*R)
+
     ids_rows, cnts_rows = [], []
     for row in draws:
         uniq, cnt = torch.unique(row, return_counts=True)
         ids_rows.append(uniq.cpu().tolist())
         cnts_rows.append(cnt.cpu().tolist())
+
     reshape = lambda flat: [flat[i * L:(i + 1) * L] for i in range(B)]
     return reshape(ids_rows), reshape(cnts_rows)
 
+
 # ---------------------------------------------------------------------------
-# STREAMER WITH DOUBLE BUFFER
+# STREAMER WITH DOUBLE BUFFER (unchanged logic – minor clean‑up)
 # ---------------------------------------------------------------------------
 class DistributedStreamer:
     def __init__(self, args: Args, device: torch.device, rank: int, world: int):
         self.rank, self.world, self.device = rank, world, device
+
         cfg = AutoConfig.from_pretrained(args.model_name)
         cfg.attn_implementation = "eager"
+
+        # low_cpu_mem_usage keeps weights off‑device until needed
         self.model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, config=cfg, device_map={"": "cpu"}, torch_dtype=torch.bfloat16
+            args.model_name,
+            config=cfg,
+            device_map={"": "cpu"},
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
         )
+
         self.model.config.attn_implementation = "flash_attention_2"
         self.layers = list(self.model.model.layers)
         self.rotary = self.model.model.rotary_emb
@@ -165,7 +199,8 @@ class DistributedStreamer:
 
         for idx, layer in enumerate(self.layers):
             # wait previous prefetch
-            for h in next_handles: h.wait()
+            for h in next_handles:
+                h.wait()
             next_handles = []
 
             # compute layer
@@ -187,22 +222,29 @@ class DistributedStreamer:
                 if self.rank == owner:
                     nxt_layer.to(self.device, non_blocking=True)
                 next_handles = self._async_broadcast(nxt_layer, owner)
+
             # free current
             layer.to("cpu", non_blocking=True)
             torch.cuda.empty_cache()
             if shutdown_evt.is_set():
                 break
 
-        # ---- lm_head & sampling with **seq‑at‑a‑time** to cap memory ----
+        # ---- lm_head & sampling (seq‑at‑a‑time) ----
         ids_all, cnts_all = [], []
         for s in states:
-            # Guarantee micro‑batch of 1 for logits to avoid OOM
-            for seq_hidden in s["hidden"].split(1, dim=0):
+            for seq_hidden in s["hidden"].split(1, dim=0):  # micro‑batch = 1
                 logits = self.lm_head(seq_hidden)
                 i, c = sample_distribution(logits, N, R, temp)
                 ids_all.extend(i)
                 cnts_all.extend(c)
+
+        # help GC right away
+        del states, mic_inp, logits, seq_hidden
+        torch.cuda.empty_cache()
+        gc.collect()
+
         return ids_all, cnts_all
+
 
 # ---------------------------------------------------------------------------
 # IO HELPERS
@@ -210,6 +252,7 @@ class DistributedStreamer:
 
 def collate_fn(ex, tok, ml):
     return tok([e["text"] for e in ex], return_tensors="pt", padding=True, truncation=True, max_length=ml)
+
 
 def stream_loader(ds, tok, bs, ml, rank, world):
     batch = []
@@ -227,20 +270,31 @@ def stream_loader(ds, tok, bs, ml, rank, world):
     if batch and not shutdown_evt.is_set():
         yield collate_fn(batch, tok, ml)
 
-def push_shard(local, args: Args, rank: int):
-    gather = [None] * dist.get_world_size() if rank == 0 else None
-    dist.gather_object(local, gather, 0)
-    if rank != 0:
+
+# ------ NEW: direct, git‑free upload per‑rank --------------------------------
+
+def push_shard(local_buf: list, args: Args, rank: int, shard_idx: int):
+    """Flush `local_buf` to a Parquet shard and upload directly to the Hub *without* Git."""
+    if not local_buf:
         return
-    merged = [rec for part in gather for rec in part]
-    if not merged:
-        return
+
+    ds = Dataset.from_list(local_buf)
+    fname = f"data_rank{rank:02d}_{shard_idx:05d}.parquet"
+    ds.to_parquet(fname)
+
     api = HfApi(token=args.hf_token)
-    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
-    fname = f"data_{idx:05d}.parquet"
-    Dataset.from_list(merged).to_parquet(fname)
-    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
-    repo.git_pull(); repo.git_add(fname); repo.git_commit(f"Add shard {idx}"); repo.git_push(); repo.git_clear(); os.remove(fname)
+    api.upload_file(
+        path_or_fileobj=fname,
+        path_in_repo=fname,
+        repo_id=args.output_repo,
+        repo_type="dataset",
+        commit_message=f"Add shard {shard_idx} from rank {rank}",
+    )
+
+    os.remove(fname)
+    local_buf.clear()
+    gc.collect()
+
 
 # ---------------------------------------------------------------------------
 # WORKER
@@ -249,31 +303,58 @@ def push_shard(local, args: Args, rank: int):
 def worker(a: Args):
     _, rank, world, dev = setup_distributed()
     print(f"[rank {rank}] on {dev}")
+
     tok = AutoTokenizer.from_pretrained(a.model_name)
     streamer = DistributedStreamer(a, dev, rank, world)
     ds = load_dataset(a.dataset_name, split=a.dataset_split, token=a.hf_token, streaming=True)
     loader = stream_loader(ds, tok, a.batch_size, a.max_seq_len, rank, world)
 
-    buf, seen = [], 0
+    buf, seen, shard_idx = [], 0, 0
     try:
         for batch in loader:
             if shutdown_evt.is_set():
                 break
-            ids, cnts = streamer.sample(batch["input_ids"], a.micro_batch_size, a.num_samples, a.num_rounds, a.sampling_temperature)
+
+            ids, cnts = streamer.sample(
+                batch["input_ids"],
+                a.micro_batch_size,
+                a.num_samples,
+                a.num_rounds,
+                a.sampling_temperature,
+            )
+
             for i, toks in enumerate(batch["input_ids"]):
                 seq = toks.tolist()
                 while seq and seq[-1] == 0:
                     seq.pop()
                 L = len(seq)
-                buf.append({"input_ids": seq, "sampled_ids": ids[i][:L], "sampled_counts": cnts[i][:L]})
+                buf.append({
+                    "input_ids": seq,
+                    "sampled_ids": ids[i][:L],
+                    "sampled_counts": cnts[i][:L],
+                })
+
             seen += len(batch["input_ids"])
             if seen >= a.push_every:
-                push_shard(buf, a, rank); buf.clear(); seen = 0
+                push_shard(buf, a, rank, shard_idx)
+                shard_idx += 1
+                seen = 0
+
+            # make sure to free the large lists ASAP
+            del ids, cnts
+            gc.collect()
+
     except Exception as e:
-        print(f"[rank {rank}] error {e}"); shutdown_evt.set()
+        print(f"[rank {rank}] error {e}")
+        shutdown_evt.set()
+
+    # final flush
     if buf and not shutdown_evt.is_set():
-        push_shard(buf, a, rank)
-    safe_barrier(); print(f"[rank {rank}] exit")
+        push_shard(buf, a, rank, shard_idx)
+
+    safe_barrier()
+    print(f"[rank {rank}] exit")
+
 
 # ---------------------------------------------------------------------------
 # MAIN
