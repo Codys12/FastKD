@@ -172,7 +172,8 @@ class ReversePipelineEngine:
         """Embed tokens then run through streamed blocks and lm_head."""
         # --- ensure embed weights exist on this rank (layer 0) ---
         self._stream_layer(0)
-        embed = self.layers[0]  # already materialised on this GPU
+        # after streaming layer‑0, weights live on CPU – move them to this GPU
+        embed = self.layers[0].to(self.device, non_blocking=True)
         hidden = embed(input_ids)
         embed.to("cpu", non_blocking=True)
         torch.cuda.current_stream().synchronize()
