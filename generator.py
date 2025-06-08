@@ -172,7 +172,7 @@ class ReversePipelineEngine:
         """Embed tokens then run through streamed blocks and lm_head."""
         # --- ensure embed weights exist on this rank (layer 0) ---
         self._stream_layer(0)
-        embed = self.layers[0].to(self.device, non_blocking=True)
+        embed = self.layers[0]  # already materialised on this GPU
         hidden = embed(input_ids)
         embed.to("cpu", non_blocking=True)
         torch.cuda.current_stream().synchronize()
@@ -288,7 +288,7 @@ def worker(args: Args):
 
             dbg(f"Batch {batch_idx} acquired")
             input_ids = batch["input_ids"].to(engine.device, non_blocking=True)
-            ids, cnts = engine.sample(input_ids)(hidden)
+            ids, cnts = engine.sample(input_ids)
 
             for i in range(len(input_ids)):
                 toks = input_ids[i].tolist()
