@@ -128,7 +128,7 @@ class ReversePipelineEngine:
         else:
             dbg("Building empty‑weight skeleton")
             try:
-                from accelerate.utils import init_empty_weights
+                from accelerate import init_empty_weights
                 with init_empty_weights():
                     model = AutoModelForCausalLM.from_config(cfg)
             except ImportError:
