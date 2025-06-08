@@ -105,6 +105,7 @@ class FlatPacket:
 ###############################################################################
 
 class ReversePipelineEngine:
+    """Streams layers through static data; ensures embed weights exist on each rank."""
     def __init__(self, args: Args, rank: int, world: int, dbg):
         self.args = args
         self.rank = rank
