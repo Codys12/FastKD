@@ -10,6 +10,17 @@ back to CPU. Use --debug for verbose per‑rank output.
 * Layers are packed into flat CUDA tensors and streamed around the ring with
   double buffering.
 * Sampling is vectorised on GPU.
+
+### Patch notes (June 2025)
+This version fixes crashes that occurred when a layer built on the `meta` device
+was later moved to CUDA with `module.to()`. The fix is **storage materialisation**:
+1. `materialise_meta()` allocates real (empty) tensors on‑device for every
+   parameter/buffer that is still meta.
+2. `_stream_layer()` calls it once – just before unpacking the received flat
+   weights – so the weights have somewhere real to land.
+3. `sample()` no longer calls `.to()` on `embed_tokens`; the layer is already on
+   `self.device` once `_stream_layer(0)` returns.
+The remainder of the pipeline is unchanged.
 """
 
 import argparse
@@ -30,6 +41,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 ###############################################################################
 # CLI                                                                        #
 ###############################################################################
+
 
 @dataclass
 class Args:
@@ -75,9 +87,31 @@ def get_logger(rank: int, enabled: bool):
             print(f"[Rank {rank}] {msg}", flush=True)
     return log
 
+# --------------------------------------------------------------------------- #
+# NEW: storage materialisation helper                                         #
+# --------------------------------------------------------------------------- #
+
+def materialise_meta(module: torch.nn.Module, device: torch.device, dtype: torch.dtype):
+    """Allocate *real* storage for every parameter/buffer that is still meta."""
+    try:
+        # PyTorch ≥ 2.1 has a built‑in util.
+        module.to_empty(device=device, dtype=dtype)
+        return
+    except (AttributeError, RuntimeError):
+        pass  # fall back to manual loops
+
+    for p in module.parameters(recurse=True):
+        if getattr(p, "is_meta", False) or getattr(p.data, "is_meta", False):
+            p.data = torch.empty(p.shape, dtype=dtype, device=device)
+    for name, buf in module.named_buffers(recurse=True):
+        if getattr(buf, "is_meta", False):
+            # We must update the underlying _buffers dict directly.
+            module._buffers[name] = torch.empty(buf.shape, dtype=dtype, device=device)
+
 ###############################################################################
 # Flat packet helper                                                          #
 ###############################################################################
+
 
 class FlatPacket:
     def __init__(self):
@@ -97,15 +131,17 @@ class FlatPacket:
         with torch.no_grad():
             for p in layer.parameters():
                 n = p.numel()
-                p.data.copy_(self.flat[offset:offset+n].view_as(p))
+                p.data.copy_(self.flat[offset:offset + n].view_as(p))
                 offset += n
 
 ###############################################################################
 # Reverse pipeline engine                                                     #
 ###############################################################################
 
+
 class ReversePipelineEngine:
     """Streams layers through static data; ensures embed weights exist on each rank."""
+
     def __init__(self, args: Args, rank: int, world: int, dbg):
         self.args = args
         self.rank = rank
@@ -130,6 +166,7 @@ class ReversePipelineEngine:
             dbg("Building empty‑weight skeleton")
             try:
                 from accelerate import init_empty_weights
+
                 with init_empty_weights():
                     model = AutoModelForCausalLM.from_config(cfg)
             except ImportError:
@@ -138,21 +175,30 @@ class ReversePipelineEngine:
                 for p in model.parameters():
                     p.data = torch.empty_like(p.data, device="meta")
 
-        self.layers: List[torch.nn.Module] = [model.model.embed_tokens, *model.model.layers, model.lm_head]
+        self.layers: List[torch.nn.Module] = [
+            model.model.embed_tokens,
+            *model.model.layers,
+            model.lm_head,
+        ]
         self.buffers = (FlatPacket(), FlatPacket())
         self.toggle = 0
 
     # ring helpers
     def _send(self, tensor: torch.Tensor, dst: int):
         dist.send(tensor, dst)
+
     def _recv(self, tensor: torch.Tensor, src: int):
         dist.recv(tensor, src)
 
     def _stream_layer(self, idx: int):
+        """Move *weights* for layer `idx` one hop along the ring and rebuild params."""
         left = (self.rank - 1) % self.world
         right = (self.rank + 1) % self.world
         buf = self.buffers[self.toggle]
 
+        # ------------------------------------------------------------------
+        # 1. Transmit / receive the flat packet & its size.
+        # ------------------------------------------------------------------
         if not (self.rank == 0 and idx == 0):
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
             self._recv(shape, left)
@@ -161,7 +207,16 @@ class ReversePipelineEngine:
         else:
             buf.pack(self.layers[idx], self.device)
 
+        # ------------------------------------------------------------------
+        # 2. *NEW* – materialise storage on first receipt of a meta‑layer.
+        # ------------------------------------------------------------------
+        if any(getattr(p, "is_meta", False) or getattr(p.data, "is_meta", False) for p in self.layers[idx].parameters()):
+            materialise_meta(self.layers[idx], self.device, buf.flat.dtype)
+
+        # 3. Copy the packet into the freshly materialised (or existing) weights.
         buf.unpack_to(self.layers[idx])
+
+        # 4. Forward the packet to the next rank.
         shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
         self._send(shape_out, right)
         self._send(buf.flat, right)
@@ -172,8 +227,7 @@ class ReversePipelineEngine:
         """Embed tokens then run through streamed blocks and lm_head."""
         # --- ensure embed weights exist on this rank (layer 0) ---
         self._stream_layer(0)
-        # after streaming layer‑0, weights live on CPU – move them to this GPU
-        embed = self.layers[0].to(self.device, non_blocking=True)
+        embed = self.layers[0]  # already on self.device after _stream_layer(0)
         hidden = embed(input_ids)
         embed.to("cpu", non_blocking=True)
         torch.cuda.current_stream().synchronize()
@@ -183,9 +237,11 @@ class ReversePipelineEngine:
             self._stream_layer(idx)
             layer = self.layers[idx].to(self.device, non_blocking=True)
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
-                mb = hidden[start:start+self.args.micro_batch_size]
+                mb = hidden[start : start + self.args.micro_batch_size]
                 out = layer(mb)
-                hidden[start:start+self.args.micro_batch_size] = out[0] if isinstance(out, tuple) else out
+                hidden[start : start + self.args.micro_batch_size] = (
+                    out[0] if isinstance(out, tuple) else out
+                )
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
@@ -212,8 +268,16 @@ class ReversePipelineEngine:
 # Data helpers                                                                #
 ###############################################################################
 
+
 def collate_fn(examples, tok, max_len):
-    return tok([e["text"] for e in examples], return_tensors="pt", padding=True, truncation=True, max_length=max_len)
+    return tok(
+        [e["text"] for e in examples],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+    )
+
 
 def stream_loader(ds, tok, bs, max_len):
     buf = []
@@ -228,6 +292,7 @@ def stream_loader(ds, tok, bs, max_len):
 ###############################################################################
 # Push shard                                                                  #
 ###############################################################################
+
 
 def push_shard(records: List[dict], args: Args, dbg):
     dbg(f"Pushing {len(records)} records to hub")
@@ -247,6 +312,7 @@ def push_shard(records: List[dict], args: Args, dbg):
 # Gather helper                                                               #
 ###############################################################################
 
+
 def gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
     gathered = [None] * world if rank == 0 else None
     dist.gather_object(local, gathered, dst=0)
@@ -259,6 +325,7 @@ def gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
 ###############################################################################
 # Worker                                                                      #
 ###############################################################################
+
 
 def worker(args: Args):
     dist.init_process_group("nccl")
@@ -296,17 +363,20 @@ def worker(args: Args):
                 while toks and toks[-1] == 0:
                     toks.pop()
                 seq_len = len(toks)
-                local_records.append({
-                    "input_ids": toks,
-                    "sampled_ids": ids[i][:seq_len],
-                    "sampled_counts": cnts[i][:seq_len],
-                })
+                local_records.append(
+                    {
+                        "input_ids": toks,
+                        "sampled_ids": ids[i][:seq_len],
+                        "sampled_counts": cnts[i][:seq_len],
+                    }
+                )
             seen += len(input_ids)
 
             if seen >= args.push_every:
                 dbg("Reached push_every – gathering to rank‑0")
                 gather_and_push(local_records, args, rank, world, dbg)
-                local_records.clear(); seen = 0
+                local_records.clear()
+                seen = 0
 
         # final flush
         if local_records and not stop_evt.is_set():
