@@ -168,24 +168,34 @@ class ReversePipelineEngine:
         self.toggle ^= 1
 
     @torch.no_grad()
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        for i in range(len(self.layers)):
-            self._stream_layer(i)
-            layer = self.layers[i].to(self.device)
+    def sample(self, input_ids: torch.Tensor):
+        """Embed tokens then run through streamed blocks and lm_head."""
+        # --- ensure embed weights exist on this rank (layer 0) ---
+        self._stream_layer(0)
+        embed = self.layers[0].to(self.device, non_blocking=True)
+        hidden = embed(input_ids)
+        embed.to("cpu", non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+        # --- run remaining layers (1 .. end) ---
+        for idx in range(1, len(self.layers)):
+            self._stream_layer(idx)
+            layer = self.layers[idx].to(self.device, non_blocking=True)
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
                 mb = hidden[start:start+self.args.micro_batch_size]
                 out = layer(mb)
                 hidden[start:start+self.args.micro_batch_size] = out[0] if isinstance(out, tuple) else out
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
-        return hidden
 
-    @torch.no_grad()
-    def sample(self, hidden: torch.Tensor):
-        logits = self.forward(hidden)
+        logits = hidden  # after lm_head
         probs = torch.softmax(logits / self.args.sampling_temperature, dim=-1)
-        draws = torch.multinomial(probs.view(-1, probs.size(-1)), self.args.num_samples * self.args.num_rounds, replacement=True)
-        draws = draws.view(*probs.shape[:-1], -1)
+        draws = torch.multinomial(
+            probs.view(-1, probs.size(-1)),
+            self.args.num_samples * self.args.num_rounds,
+            replacement=True,
+        ).view(*probs.shape[:-1], -1)
+
         ids_all, counts_all = [], []
         for b in range(draws.size(0)):
             ids_seq, cnts_seq = [], []
@@ -278,8 +288,7 @@ def worker(args: Args):
 
             dbg(f"Batch {batch_idx} acquired")
             input_ids = batch["input_ids"].to(engine.device, non_blocking=True)
-            hidden = engine.layers[0].to(engine.device)(input_ids)  # embed once per batch
-            ids, cnts = engine.sample(hidden)
+            ids, cnts = engine.sample(input_ids)(hidden)
 
             for i in range(len(input_ids)):
                 toks = input_ids[i].tolist()
