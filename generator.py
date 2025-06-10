@@ -1,25 +1,26 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 """
 Generator with reverse pipeline parallelism (ring) and optional debug logs.
-Weights travel  CPU → GPU-0 → … → GPU-N-1 → GPU-0.  Rank‑0 then off‑loads the
-last layer back to CPU.  Use --debug for verbose per‑rank output.
+Weights travel  CPU → GPU-0 → … → GPU-N-1 → GPU-0.  Rank-0 then off-loads the
+last layer back to CPU.  Use --debug for verbose per-rank output.
 
-June 2025 **second patch**
+June 2025 **second patch**
 =========================
 
-✅ **Message‑tagged ring** – every send/recv now uses a unique *tag* derived
+✅ **Message-tagged ring** – every send/recv now uses a unique *tag* derived
    from the layer index so packets from different layers can never be
    confused.  This eliminates the catastrophic *Packet size mismatch* error
-   observed when concurrent point‑to‑point transfers arrived out of order.
+   observed when concurrent point-to-point transfers arrived out of order.
 
-✅ **Zero‑element safety** – packing *and* unpacking ignore tensors whose
-   ``numel()==0`` so flat‑packet sizes always stay consistent.
+✅ **Zero-element safety** – packing *and* unpacking ignore tensors whose
+   ``numel()==0`` so flat-packet sizes always stay consistent.
 
-✅ **Minor clean‑ups** – lint fixes, doc tweaks, explicit cloning of the
+✅ **Minor clean-ups** – lint fixes, doc tweaks, explicit cloning of the
    tokenizer’s pad token where necessary.
 
-The rest of the logic (materialisation guard, pin‑memory collator, graceful
-SIGTERM handling, etc.) is unchanged from the original June 2025 patch.
+The rest of the logic (materialisation guard, pin-memory collator, graceful
+SIGTERM handling, etc.) is unchanged from the original June 2025 patch.
 """
 
 ###############################################################################
@@ -66,7 +67,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Reverse‑pipeline KD generator (ring)")
+    p = argparse.ArgumentParser("Reverse-pipeline KD generator (ring)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -188,7 +189,7 @@ class FlatPacket:
         with torch.no_grad():
             for p in layer.parameters():
                 n = p.numel()
-                if n:  # skip zero‑element tensors
+                if n:  # skip zero-element tensors
                     p.data.copy_(self.flat[offset : offset + n].view_as(p))
                     offset += n
 
@@ -225,7 +226,7 @@ class ReversePipelineEngine:
             )
             model.config.attn_implementation = "flash_attention_2"
         else:
-            dbg("Building empty‑weight skeleton on meta")
+            dbg("Building empty-weight skeleton on meta")
             try:
                 from accelerate import init_empty_weights
 
@@ -249,7 +250,7 @@ class ReversePipelineEngine:
         self.toggle = 0
 
     # ..................................................................... #
-    # Ring helpers – now TAG‑AWARE                                         #
+    # Ring helpers – now TAG-AWARE                                         #
     # ..................................................................... #
 
     @staticmethod
@@ -323,7 +324,7 @@ class ReversePipelineEngine:
         embed.to("cpu", non_blocking=True)  # keep vRAM down
         torch.cuda.current_stream().synchronize()
 
-        # ---------- 2. Transformer blocks (idx 1 … n‑2) ----------------- #
+        # ---------- 2. Transformer blocks (idx 1 … n-2) ----------------- #
         for idx in range(1, len(self.layers) - 1):
             self._stream_layer(idx)
             layer = self.layers[idx].to(self.device, non_blocking=True)
@@ -337,7 +338,7 @@ class ReversePipelineEngine:
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
-        # ---------- 3. lm_head (idx n‑1) -------------------------------- #
+        # ---------- 3. lm_head (idx n-1) -------------------------------- #
         idx = len(self.layers) - 1
         self._stream_layer(idx)
         head = self.layers[idx].to(self.device, non_blocking=True)
@@ -507,7 +508,7 @@ def worker(args: Args):
             seen += len(input_ids)
 
             if seen >= args.push_every:
-                dbg("Reached push_every – gathering to rank‑0")
+                dbg("Reached push_every – gathering to rank-0")
                 gather_and_push(local_records, args, rank, world, dbg)
                 local_records.clear()
                 seen = 0
@@ -528,7 +529,7 @@ def worker(args: Args):
 
 
 ###############################################################################
-# Entry‑point                                                                 #
+# Entry-point                                                                 #
 ###############################################################################
 
 
