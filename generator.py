@@ -285,7 +285,16 @@ class ReversePipelineEngine:
         self._send(shape_out, right, shape_tag)
         if buf.flat.numel():
             self._send(buf.flat, right, data_tag)
-
+        # Rank-0 started the packet in UID 0; receive it back to
+        # unblock the last rank and fully close the ring.
+        if first_pass_rank0:
+            shape_back = torch.empty(1, dtype=torch.int64, device=self.device)
+            self._recv(shape_back, left, shape_tag)        # from rank 7
+            numel_back = int(shape_back.item())
+            if numel_back:
+                tmp = torch.empty(numel_back, dtype=buf.flat.dtype,
+                                  device=self.device)
+                self._recv(tmp, left, data_tag)
         self.toggle ^= 1  # swap buffers
 
     # ............................. Forward + sampling ..................... #
