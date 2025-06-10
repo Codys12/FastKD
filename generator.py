@@ -293,6 +293,7 @@ class ReversePipelineEngine:
     def sample(self, input_ids: torch.Tensor) -> Tuple[list, list]:
         """Embed tokens then run through streamed blocks and lm_head."""
         # Step-unique UID guarantees isolated tag-space for this call.
+        dist.barrier()
         uid_this_call = self.uid
 
         # ---------- 1 · Embedding layer ---------------------------------- #
