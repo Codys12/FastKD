@@ -1,21 +1,25 @@
 from __future__ import annotations
 """
 Generator with reverse pipeline parallelism (ring) and optional debug logs.
-Weights travel  CPU → GPU-0 → … → GPU-N-1 → GPU-0.  Rank-0 then off-loads the
-last layer back to CPU.  Use --debug for verbose per-rank output.
+Weights travel  CPU → GPU-0 → … → GPU-N-1 → GPU-0.  Rank‑0 then off‑loads the
+last layer back to CPU.  Use --debug for verbose per‑rank output.
 
-June 2025 patch
-===============
+June 2025 **second patch**
+=========================
 
-* **Robust storage materialisation**  (see `materialise_meta()`)
-* **Meta-state sanity checks**
-* **Packet integrity guard**
-* **Quality-of-life**: fast pin-memory collator, local time stamps.
+✅ **Message‑tagged ring** – every send/recv now uses a unique *tag* derived
+   from the layer index so packets from different layers can never be
+   confused.  This eliminates the catastrophic *Packet size mismatch* error
+   observed when concurrent point‑to‑point transfers arrived out of order.
 
-This version additionally fixes:
-  • AttributeError caused by `BatchEncoding.pin_memory()`
-  • Shape clash when writing logits into the hidden state
-  • Edge cases around zero-element tensors
+✅ **Zero‑element safety** – packing *and* unpacking ignore tensors whose
+   ``numel()==0`` so flat‑packet sizes always stay consistent.
+
+✅ **Minor clean‑ups** – lint fixes, doc tweaks, explicit cloning of the
+   tokenizer’s pad token where necessary.
+
+The rest of the logic (materialisation guard, pin‑memory collator, graceful
+SIGTERM handling, etc.) is unchanged from the original June 2025 patch.
 """
 
 ###############################################################################
@@ -62,7 +66,7 @@ class Args:
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Reverse-pipeline KD generator (ring)")
+    p = argparse.ArgumentParser("Reverse‑pipeline KD generator (ring)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -103,18 +107,11 @@ def _has_real_storage(t: torch.Tensor) -> bool:
     return not (getattr(t, "is_meta", False) or getattr(t.data, "is_meta", False))
 
 
-def materialise_meta(module: torch.nn.Module,
-                     device: torch.device,
-                     dtype: torch.dtype):
-    """
-    Ensure *all* params & buffers of *module* live on the indicated device
-    with real backing storage.  Works across PyTorch versions:
+def materialise_meta(module: torch.nn.Module, device: torch.device, dtype: torch.dtype):
+    """Ensure *all* params & buffers of *module* live on *device* with storage."""
 
-      * ≥ 2.1  : Module.to_empty(device=…, dtype=…)
-      * 2.0.x  : Module.to_empty(device=…)        (no dtype arg)
-      * < 2.0  : no to_empty() – manual loop
-    """
     to_empty = getattr(module, "to_empty", None)
+    fallback_exc: Exception | None = None
 
     if callable(to_empty):
         try:
@@ -125,36 +122,28 @@ def materialise_meta(module: torch.nn.Module,
             if "dtype" in sig.parameters:
                 kwargs["dtype"] = dtype
             to_empty(**kwargs)  # type: ignore[arg-type]
-            fallback_exc: Exception | None = None
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover – fall back if not supported
             fallback_exc = exc
     else:
         fallback_exc = RuntimeError("module has no .to_empty()")
 
     if fallback_exc is not None:
-        # manual allocation fallback
         for p in module.parameters(recurse=True):
             if not _has_real_storage(p):
                 p.data = torch.empty_like(p, dtype=dtype, device=device)
         for name, buf in module.named_buffers(recurse=True):
             if not _has_real_storage(buf):
-                module._buffers[name] = torch.empty_like(buf,
-                                                         dtype=dtype,
-                                                         device=device)
+                module._buffers[name] = torch.empty_like(buf, dtype=dtype, device=device)
 
-    # post-condition check
+    # sanity – every tensor must now be real
     bad = [
         (n, "PARAM" if isinstance(t, torch.nn.Parameter) else "BUFFER")
-        for n, t in list(module.named_parameters(recurse=True))
-        + list(module.named_buffers(recurse=True))
+        for n, t in list(module.named_parameters(recurse=True)) + list(module.named_buffers(recurse=True))
         if not _has_real_storage(t)
     ]
     if bad:  # pragma: no cover
         names = ", ".join(f"{k}({kind})" for k, kind in bad)
-        raise RuntimeError(
-            "materialise_meta() failed – "
-            f"{len(bad)} tensors still meta after allocation: {names}"
-        )
+        raise RuntimeError(f"materialise_meta() failed – {len(bad)} tensors still meta: {names}")
 
 
 ###############################################################################
@@ -163,10 +152,7 @@ def materialise_meta(module: torch.nn.Module,
 
 
 class FlatPacket:
-    """
-    Serialises one *layer* worth of parameters into a single flat contiguous
-    tensor, suitable for NCCL point-to-point sends/receives.
-    """
+    """Serialises one *layer* worth of parameters into a flat contiguous tensor."""
 
     def __init__(self):
         self.flat: torch.Tensor | None = None
@@ -177,18 +163,10 @@ class FlatPacket:
 
     def pack(self, layer: torch.nn.Module, device: torch.device):
         with torch.no_grad():
-            # filter out zero-element tensors to avoid cat() complaints
             slices = [p.data.view(-1) for p in layer.parameters() if p.numel()]
-            if not slices:
-                # create a dummy zero-length tensor – still needs to flow
-                self.flat = torch.empty(0, device=device)
-            else:
-                self.flat = torch.cat(slices, out=None).contiguous().to(device)
+            self.flat = torch.cat(slices, out=None).contiguous().to(device) if slices else torch.empty(0, device=device)
 
-    def make_empty(self,
-                   numel: int,
-                   device: torch.device,
-                   dtype: torch.dtype = torch.bfloat16):
+    def make_empty(self, numel: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
         self.flat = torch.empty(numel, dtype=dtype, device=device)
 
     # ..................................................................... #
@@ -199,21 +177,20 @@ class FlatPacket:
         if self.flat is None:
             raise RuntimeError("FlatPacket.unpack_to() called before .flat is set")
 
-        param_elems = sum(p.numel() for p in layer.parameters())
-        if param_elems != self.flat.numel():
+        expected = sum(p.numel() for p in layer.parameters() if p.numel())
+        if expected != self.flat.numel():
             raise RuntimeError(
                 "Packet size mismatch: layer expects "
-                f"{param_elems:,d} elements but flat tensor has "
-                f"{self.flat.numel():,d}"
+                f"{expected:,d} elements but flat tensor has {self.flat.numel():,d}"
             )
 
         offset = 0
         with torch.no_grad():
             for p in layer.parameters():
                 n = p.numel()
-                if n:  # skip zero-element tensors
-                    p.data.copy_(self.flat[offset: offset + n].view_as(p))
-                offset += n
+                if n:  # skip zero‑element tensors
+                    p.data.copy_(self.flat[offset : offset + n].view_as(p))
+                    offset += n
 
 
 ###############################################################################
@@ -236,7 +213,7 @@ class ReversePipelineEngine:
         # 1) Build or load the model skeleton.                            #
         # --------------------------------------------------------------- #
         cfg = AutoConfig.from_pretrained(args.model_name)
-        cfg.attn_implementation = "eager"  # always safe
+        cfg.attn_implementation = "eager"  # always safe across devices
 
         if rank == 0:
             dbg("Loading full model on CPU (bf16)")
@@ -248,7 +225,7 @@ class ReversePipelineEngine:
             )
             model.config.attn_implementation = "flash_attention_2"
         else:
-            dbg("Building empty-weight skeleton on meta")
+            dbg("Building empty‑weight skeleton on meta")
             try:
                 from accelerate import init_empty_weights
 
@@ -272,23 +249,30 @@ class ReversePipelineEngine:
         self.toggle = 0
 
     # ..................................................................... #
-    # Ring helpers                                                          #
+    # Ring helpers – now TAG‑AWARE                                         #
     # ..................................................................... #
 
-    def _send(self, tensor: torch.Tensor, dst: int):
-        dist.send(tensor, dst)
+    @staticmethod
+    def _send(tensor: torch.Tensor, dst: int, tag: int):
+        dist.send(tensor, dst=dst, tag=tag)
 
-    def _recv(self, tensor: torch.Tensor, src: int):
-        dist.recv(tensor, src)
+    @staticmethod
+    def _recv(tensor: torch.Tensor, src: int, tag: int):
+        dist.recv(tensor, src=src, tag=tag)
 
     # ..................................................................... #
     # Streaming one layer                                                   #
     # ..................................................................... #
+
     def _stream_layer(self, idx: int):
         """Move *weights* for layer `idx` one hop along the ring and rebuild params."""
         left = (self.rank - 1) % self.world
         right = (self.rank + 1) % self.world
         buf = self.buffers[self.toggle]
+
+        # Use unique tags so transfers for different layers never collide.
+        shape_tag = idx * 2
+        data_tag = idx * 2 + 1
 
         # --------------------------------------------------------------- #
         # 1) Transmit / receive the flat packet and its length.           #
@@ -296,10 +280,11 @@ class ReversePipelineEngine:
         first_pass_rank0 = self.rank == 0 and idx == 0
         if not first_pass_rank0:
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
-            self._recv(shape, left)
-            buf.make_empty(int(shape.item()), self.device)
-            if buf.flat.numel():  # zero-size tensors are legal but cheap to skip
-                self._recv(buf.flat, left)
+            self._recv(shape, left, shape_tag)
+            numel = int(shape.item())
+            buf.make_empty(numel, self.device)
+            if numel:
+                self._recv(buf.flat, left, data_tag)
         else:
             buf.pack(self.layers[idx], self.device)
 
@@ -319,14 +304,15 @@ class ReversePipelineEngine:
         # 4) Forward packet to the next rank.                             #
         # --------------------------------------------------------------- #
         shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
-        self._send(shape_out, right)
+        self._send(shape_out, right, shape_tag)
         if buf.flat.numel():
-            self._send(buf.flat, right)
+            self._send(buf.flat, right, data_tag)
         self.toggle ^= 1  # flip buffer
 
     # ..................................................................... #
     # Forward + multinomial sampling                                        #
     # ..................................................................... #
+
     @torch.no_grad()
     def sample(self, input_ids: torch.Tensor) -> Tuple[list, list]:
         """Embed tokens then run through streamed blocks and lm_head."""
@@ -337,50 +323,49 @@ class ReversePipelineEngine:
         embed.to("cpu", non_blocking=True)  # keep vRAM down
         torch.cuda.current_stream().synchronize()
 
-        # ---------- 2. Transformer blocks (idx 1 … n-2) ----------------- #
+        # ---------- 2. Transformer blocks (idx 1 … n‑2) ----------------- #
         for idx in range(1, len(self.layers) - 1):
             self._stream_layer(idx)
             layer = self.layers[idx].to(self.device, non_blocking=True)
 
-            # micro-batch loop (needed only if batch too big for memory)
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
-                mb = hidden[start:start + self.args.micro_batch_size]
+                mb = hidden[start : start + self.args.micro_batch_size]
                 out = layer(mb)
                 mb_out = out[0] if isinstance(out, tuple) else out
-                hidden[start:start + self.args.micro_batch_size] = mb_out
+                hidden[start : start + self.args.micro_batch_size] = mb_out
 
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
-        # ---------- 3. lm_head (idx n-1) -------------------------------- #
+        # ---------- 3. lm_head (idx n‑1) -------------------------------- #
         idx = len(self.layers) - 1
         self._stream_layer(idx)
         head = self.layers[idx].to(self.device, non_blocking=True)
 
         logits_chunks: List[torch.Tensor] = []
         for start in range(0, hidden.size(0), self.args.micro_batch_size):
-            mb = hidden[start:start + self.args.micro_batch_size]
+            mb = hidden[start : start + self.args.micro_batch_size]
             out = head(mb)
             logits_chunks.append(out[0] if isinstance(out, tuple) else out)
 
         head.to("cpu", non_blocking=True)
         torch.cuda.current_stream().synchronize()
-
         logits = torch.cat(logits_chunks, dim=0)
 
         # ---------- 4. Vectorised multinomial sampling ------------------ #
-        probs = torch.softmax(
-            logits / self.args.sampling_temperature, dim=-1
-        )
-
+        probs = torch.softmax(logits / self.args.sampling_temperature, dim=-1)
         if probs.numel() == 0:
             raise RuntimeError("Got empty probability tensor during sampling.")
 
-        draws = torch.multinomial(
-            probs.view(-1, probs.size(-1)),
-            self.args.num_samples * self.args.num_rounds,
-            replacement=True,
-        ).view(*probs.shape[:-1], -1)
+        draws = (
+            torch.multinomial(
+                probs.view(-1, probs.size(-1)),
+                self.args.num_samples * self.args.num_rounds,
+                replacement=True,
+            )
+            .view(*probs.shape[:-1], -1)
+            .contiguous()
+        )
 
         ids_all, counts_all = [], []
         for b in range(draws.size(0)):
@@ -400,11 +385,7 @@ class ReversePipelineEngine:
 
 
 def _pin_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Recursively pin all tensor values inside the transformers.BatchEncoding
-    (or plain dict) so that `.to(device, non_blocking=True)` uses the
-    fast P2P path.  Non-tensor entries are left untouched.
-    """
+    """Pin all tensor values so `.to(device, non_blocking=True)` is fast."""
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
             batch[k] = v.pin_memory()
@@ -447,8 +428,7 @@ def push_shard(records: List[dict], args: Args, dbg):
     fname = f"data_{idx:05d}.parquet"
     Dataset.from_list(records).to_parquet(fname)
 
-    repo = Repository("repo_tmp", clone_from=args.output_repo,
-                      token=args.hf_token, repo_type="dataset")
+    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
     repo.git_pull()
     repo.git_add(fname)
     repo.git_commit(f"add shard {idx}")
@@ -489,6 +469,9 @@ def worker(args: Args):
     try:
         engine = ReversePipelineEngine(args, rank, world, dbg)
         tok = AutoTokenizer.from_pretrained(args.model_name)
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token  # ensure padding exists
+
         ds = load_dataset(
             args.dataset_name,
             split=args.dataset_split,
@@ -510,8 +493,7 @@ def worker(args: Args):
 
             for i in range(len(input_ids)):
                 toks = input_ids[i].tolist()
-                # strip right-padding (0)
-                while toks and toks[-1] == 0:
+                while toks and toks[-1] == tok.pad_token_id:  # strip padding
                     toks.pop()
 
                 seq_len = len(toks)
@@ -525,7 +507,7 @@ def worker(args: Args):
             seen += len(input_ids)
 
             if seen >= args.push_every:
-                dbg("Reached push_every – gathering to rank-0")
+                dbg("Reached push_every – gathering to rank‑0")
                 gather_and_push(local_records, args, rank, world, dbg)
                 local_records.clear()
                 seen = 0
@@ -546,7 +528,7 @@ def worker(args: Args):
 
 
 ###############################################################################
-# Entry-point                                                                 #
+# Entry‑point                                                                 #
 ###############################################################################
 
 
