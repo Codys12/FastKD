@@ -420,15 +420,19 @@ def push_shard(records: List[dict], args: Args, dbg):
     fname = f"data_{idx:05d}.parquet"
     Dataset.from_list(records).to_parquet(fname)
 
-    repo = Repository("repo_tmp",
-                      clone_from=args.output_repo,
-                      token=args.hf_token,
-                      repo_type="dataset")
-    repo.git_pull()
-    repo.git_add(fname)
-    repo.git_commit(f"add shard {idx}")
-    repo.git_push()
-    repo.git_clear()
+    from huggingface_hub import CommitOperationAdd
+
+    api = HfApi(token=args.hf_token)
+    # Creates the repo the first time, is a no-op afterwards.
+    api.create_repo(args.output_repo, repo_type="dataset", exist_ok=True)
+
+    ops = [CommitOperationAdd(path_in_repo=fname, path_or_fileobj=fname)]
+    api.create_commit(
+        repo_id=args.output_repo,
+        repo_type="dataset",
+        operations=ops,
+        commit_message=f"add shard {idx}",
+    )
     os.remove(fname)
 
 
