@@ -7,28 +7,15 @@ last layer back to CPU.  Use --debug for verbose per-rank output.
 June 2025 patch
 ===============
 
-* **Robust storage materialisation**
-  PyTorch ≥ 2.1 added `Module.to_empty(device=…, dtype=…)`; older builds either
-  expose `to_empty(device=…)` (no *dtype*) or no `to_empty` at all.  The helper
-  now:
-
-  1. Reflects on the callable signature and only passes parameters that exist.
-  2. Falls back to an explicit loop (same logic as before) if `to_empty`
-    is absent **or** raises.
-
+* **Robust storage materialisation**  (see `materialise_meta()`)
 * **Meta-state sanity checks**
-  `materialise_meta()` verifies *every* parameter/buffer has real storage on the
-  target device after it finishes; otherwise it raises immediately with a clear
-  hint instead of letting you discover the mismatch during the forward pass.
-
 * **Packet integrity guard**
-  `FlatPacket.unpack_to()` checks that the flat tensor exactly matches the
-  number of elements in the target layer and refuses to proceed if not.
+* **Quality-of-life**: fast pin-memory collator, local time stamps.
 
-* **Minor quality-of-life**
-  * `collate_fn()` pin-memories the tensors so `to(device, non_blocking=True)`
-    uses the P2P path.
-  * Debug logger prints the local time so ranks stay in-sync.
+This version additionally fixes:
+  • AttributeError caused by `BatchEncoding.pin_memory()`
+  • Shape clash when writing logits into the hidden state
+  • Edge cases around zero-element tensors
 """
 
 ###############################################################################
@@ -44,7 +31,7 @@ import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -91,6 +78,7 @@ def parse_args() -> Args:
     p.add_argument("--debug", action="store_true")
     return Args(**vars(p.parse_args()))
 
+
 ###############################################################################
 # Utils                                                                       #
 ###############################################################################
@@ -101,6 +89,7 @@ def get_logger(rank: int, enabled: bool):
         if enabled:
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now} | rank {rank}] {msg}", flush=True)
+
     return log
 
 
@@ -108,11 +97,15 @@ def get_logger(rank: int, enabled: bool):
 # NEW: storage materialisation helper                                         #
 # --------------------------------------------------------------------------- #
 
+
 def _has_real_storage(t: torch.Tensor) -> bool:
+    # torch 2.1 added the public attribute .is_meta; older builds require this
     return not (getattr(t, "is_meta", False) or getattr(t.data, "is_meta", False))
 
 
-def materialise_meta(module: torch.nn.Module, device: torch.device, dtype: torch.dtype):
+def materialise_meta(module: torch.nn.Module,
+                     device: torch.device,
+                     dtype: torch.dtype):
     """
     Ensure *all* params & buffers of *module* live on the indicated device
     with real backing storage.  Works across PyTorch versions:
@@ -121,53 +114,48 @@ def materialise_meta(module: torch.nn.Module, device: torch.device, dtype: torch
       * 2.0.x  : Module.to_empty(device=…)        (no dtype arg)
       * < 2.0  : no to_empty() – manual loop
     """
-    # ------------------------------------------------------------------ #
-    # 1) Try the most capable native API first, *adapting* to signature. #
-    # ------------------------------------------------------------------ #
     to_empty = getattr(module, "to_empty", None)
+
     if callable(to_empty):
         try:
-            kw = {}
+            kwargs = {}
             sig = inspect.signature(to_empty)
             if "device" in sig.parameters:
-                kw["device"] = device
+                kwargs["device"] = device
             if "dtype" in sig.parameters:
-                kw["dtype"] = dtype
-            to_empty(**kw)        # type: ignore[arg-type]
-        except Exception as exc:  # RuntimeError, TypeError, etc.
-            # We fall back – but keep the exception around for context.
+                kwargs["dtype"] = dtype
+            to_empty(**kwargs)  # type: ignore[arg-type]
+            fallback_exc: Exception | None = None
+        except Exception as exc:
             fallback_exc = exc
-        else:
-            fallback_exc = None
     else:
         fallback_exc = RuntimeError("module has no .to_empty()")
 
-    # ------------------------------------------------------------------ #
-    # 2) Manual allocation fallback if needed.                           #
-    # ------------------------------------------------------------------ #
     if fallback_exc is not None:
+        # manual allocation fallback
         for p in module.parameters(recurse=True):
             if not _has_real_storage(p):
-                p.data = torch.empty(p.shape, dtype=dtype, device=device)
+                p.data = torch.empty_like(p, dtype=dtype, device=device)
         for name, buf in module.named_buffers(recurse=True):
             if not _has_real_storage(buf):
-                module._buffers[name] = torch.empty(buf.shape, dtype=dtype, device=device)
+                module._buffers[name] = torch.empty_like(buf,
+                                                         dtype=dtype,
+                                                         device=device)
 
-    # ------------------------------------------------------------------ #
-    # 3) Post-condition check – infectious bug stopper.                  #
-    # ------------------------------------------------------------------ #
+    # post-condition check
     bad = [
         (n, "PARAM" if isinstance(t, torch.nn.Parameter) else "BUFFER")
         for n, t in list(module.named_parameters(recurse=True))
-                 + list(module.named_buffers(recurse=True))
+        + list(module.named_buffers(recurse=True))
         if not _has_real_storage(t)
     ]
     if bad:  # pragma: no cover
         names = ", ".join(f"{k}({kind})" for k, kind in bad)
         raise RuntimeError(
-            f"materialise_meta() failed – {len(bad)} tensors are still meta "
-            f"after allocation: {names}"
+            "materialise_meta() failed – "
+            f"{len(bad)} tensors still meta after allocation: {names}"
         )
+
 
 ###############################################################################
 # Flat packet helper                                                          #
@@ -176,8 +164,8 @@ def materialise_meta(module: torch.nn.Module, device: torch.device, dtype: torch
 
 class FlatPacket:
     """
-    Helper that serialises one *layer* worth of parameters into a single flat
-    contiguous tensor, suitable for NCCL point-to-point sends/receives.
+    Serialises one *layer* worth of parameters into a single flat contiguous
+    tensor, suitable for NCCL point-to-point sends/receives.
     """
 
     def __init__(self):
@@ -189,12 +177,18 @@ class FlatPacket:
 
     def pack(self, layer: torch.nn.Module, device: torch.device):
         with torch.no_grad():
-            self.flat = torch.cat(
-                [p.data.view(-1) for p in layer.parameters()],
-                out=None
-            ).contiguous().to(device)
+            # filter out zero-element tensors to avoid cat() complaints
+            slices = [p.data.view(-1) for p in layer.parameters() if p.numel()]
+            if not slices:
+                # create a dummy zero-length tensor – still needs to flow
+                self.flat = torch.empty(0, device=device)
+            else:
+                self.flat = torch.cat(slices, out=None).contiguous().to(device)
 
-    def make_empty(self, numel: int, device: torch.device, dtype=torch.bfloat16):
+    def make_empty(self,
+                   numel: int,
+                   device: torch.device,
+                   dtype: torch.dtype = torch.bfloat16):
         self.flat = torch.empty(numel, dtype=dtype, device=device)
 
     # ..................................................................... #
@@ -208,15 +202,17 @@ class FlatPacket:
         param_elems = sum(p.numel() for p in layer.parameters())
         if param_elems != self.flat.numel():
             raise RuntimeError(
-                f"Packet size mismatch: layer expects {param_elems:,d} elements "
-                f"but flat tensor has {self.flat.numel():,d}"
+                "Packet size mismatch: layer expects "
+                f"{param_elems:,d} elements but flat tensor has "
+                f"{self.flat.numel():,d}"
             )
 
         offset = 0
         with torch.no_grad():
             for p in layer.parameters():
                 n = p.numel()
-                p.data.copy_(self.flat[offset : offset + n].view_as(p))
+                if n:  # skip zero-element tensors
+                    p.data.copy_(self.flat[offset: offset + n].view_as(p))
                 offset += n
 
 
@@ -240,7 +236,7 @@ class ReversePipelineEngine:
         # 1) Build or load the model skeleton.                            #
         # --------------------------------------------------------------- #
         cfg = AutoConfig.from_pretrained(args.model_name)
-        cfg.attn_implementation = "eager"          # 100 % safe everywhere
+        cfg.attn_implementation = "eager"  # always safe
 
         if rank == 0:
             dbg("Loading full model on CPU (bf16)")
@@ -262,9 +258,9 @@ class ReversePipelineEngine:
                 dbg("`accelerate` not available; manual meta tensors")
                 model = AutoModelForCausalLM.from_config(cfg)
                 for p in model.parameters():
-                    p.data = torch.empty_like(p.data, device="meta")
+                    p.data = torch.empty_like(p, device="meta")
 
-        # The iteration order must match send/receive order: embed → blocks → head
+        # Iteration order must match send/recv: embed → blocks → head
         self.layers: List[torch.nn.Module] = [
             model.model.embed_tokens,
             *model.model.layers,
@@ -278,6 +274,7 @@ class ReversePipelineEngine:
     # ..................................................................... #
     # Ring helpers                                                          #
     # ..................................................................... #
+
     def _send(self, tensor: torch.Tensor, dst: int):
         dist.send(tensor, dst)
 
@@ -289,7 +286,7 @@ class ReversePipelineEngine:
     # ..................................................................... #
     def _stream_layer(self, idx: int):
         """Move *weights* for layer `idx` one hop along the ring and rebuild params."""
-        left  = (self.rank - 1) % self.world
+        left = (self.rank - 1) % self.world
         right = (self.rank + 1) % self.world
         buf = self.buffers[self.toggle]
 
@@ -298,32 +295,33 @@ class ReversePipelineEngine:
         # --------------------------------------------------------------- #
         first_pass_rank0 = self.rank == 0 and idx == 0
         if not first_pass_rank0:
-            # Receive `int64 numel`
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
             self._recv(shape, left)
             buf.make_empty(int(shape.item()), self.device)
-            self._recv(buf.flat, left)
+            if buf.flat.numel():  # zero-size tensors are legal but cheap to skip
+                self._recv(buf.flat, left)
         else:
-            # Rank-0 originates the packet
             buf.pack(self.layers[idx], self.device)
 
         # --------------------------------------------------------------- #
-        # 2) Materialise storage if this replica still has meta tensors.  #
+        # 2) Materialise storage if still meta.                           #
         # --------------------------------------------------------------- #
         if any(not _has_real_storage(p) for p in self.layers[idx].parameters()):
             materialise_meta(self.layers[idx], self.device, buf.flat.dtype)
 
         # --------------------------------------------------------------- #
-        # 3) Copy packet into the layer’s parameters (GPU-to-GPU memcpy). #
+        # 3) Copy packet into the layer’s parameters.                     #
         # --------------------------------------------------------------- #
-        buf.unpack_to(self.layers[idx])
+        if buf.flat.numel():
+            buf.unpack_to(self.layers[idx])
 
         # --------------------------------------------------------------- #
         # 4) Forward packet to the next rank.                             #
         # --------------------------------------------------------------- #
         shape_out = torch.tensor([buf.flat.numel()], dtype=torch.int64, device=self.device)
         self._send(shape_out, right)
-        self._send(buf.flat, right)
+        if buf.flat.numel():
+            self._send(buf.flat, right)
         self.toggle ^= 1  # flip buffer
 
     # ..................................................................... #
@@ -332,34 +330,51 @@ class ReversePipelineEngine:
     @torch.no_grad()
     def sample(self, input_ids: torch.Tensor) -> Tuple[list, list]:
         """Embed tokens then run through streamed blocks and lm_head."""
-        # ----- Embedding layer (idx 0) --------------------------------- #
+        # ---------- 1. Embedding layer (idx 0) -------------------------- #
         self._stream_layer(0)
-        embed = self.layers[0]               # now lives on self.device
+        embed = self.layers[0].to(self.device, non_blocking=True)
         hidden = embed(input_ids)
-
-        # Optionally drop the weights back to CPU to cap vRAM usage
-        embed.to("cpu", non_blocking=True)
+        embed.to("cpu", non_blocking=True)  # keep vRAM down
         torch.cuda.current_stream().synchronize()
 
-        # ----- Transformer blocks & lm_head (idx 1 .. end) ------------- #
-        for idx in range(1, len(self.layers)):
+        # ---------- 2. Transformer blocks (idx 1 … n-2) ----------------- #
+        for idx in range(1, len(self.layers) - 1):
             self._stream_layer(idx)
             layer = self.layers[idx].to(self.device, non_blocking=True)
 
             # micro-batch loop (needed only if batch too big for memory)
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
-                mb = hidden[start : start + self.args.micro_batch_size]
+                mb = hidden[start:start + self.args.micro_batch_size]
                 out = layer(mb)
-                hidden[start : start + self.args.micro_batch_size] = (
-                    out[0] if isinstance(out, tuple) else out
-                )
+                mb_out = out[0] if isinstance(out, tuple) else out
+                hidden[start:start + self.args.micro_batch_size] = mb_out
 
             layer.to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
-        # ----- Vectorised multinomial sampling ------------------------- #
-        logits = hidden      # after lm_head
-        probs  = torch.softmax(logits / self.args.sampling_temperature, dim=-1)
+        # ---------- 3. lm_head (idx n-1) -------------------------------- #
+        idx = len(self.layers) - 1
+        self._stream_layer(idx)
+        head = self.layers[idx].to(self.device, non_blocking=True)
+
+        logits_chunks: List[torch.Tensor] = []
+        for start in range(0, hidden.size(0), self.args.micro_batch_size):
+            mb = hidden[start:start + self.args.micro_batch_size]
+            out = head(mb)
+            logits_chunks.append(out[0] if isinstance(out, tuple) else out)
+
+        head.to("cpu", non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+
+        logits = torch.cat(logits_chunks, dim=0)
+
+        # ---------- 4. Vectorised multinomial sampling ------------------ #
+        probs = torch.softmax(
+            logits / self.args.sampling_temperature, dim=-1
+        )
+
+        if probs.numel() == 0:
+            raise RuntimeError("Got empty probability tensor during sampling.")
 
         draws = torch.multinomial(
             probs.view(-1, probs.size(-1)),
@@ -384,14 +399,27 @@ class ReversePipelineEngine:
 ###############################################################################
 
 
+def _pin_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Recursively pin all tensor values inside the transformers.BatchEncoding
+    (or plain dict) so that `.to(device, non_blocking=True)` uses the
+    fast P2P path.  Non-tensor entries are left untouched.
+    """
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            batch[k] = v.pin_memory()
+    return batch
+
+
 def collate_fn(examples, tok, max_len):
-    return tok(
+    enc = tok(
         [e["text"] for e in examples],
         return_tensors="pt",
         padding=True,
         truncation=True,
         max_length=max_len,
-    ).pin_memory()  # enables fast non-blocking .to(device)
+    )
+    return _pin_batch(enc)
 
 
 def stream_loader(ds, tok, bs, max_len):
@@ -413,11 +441,14 @@ def stream_loader(ds, tok, bs, max_len):
 def push_shard(records: List[dict], args: Args, dbg):
     dbg(f"Pushing {len(records):,d} records to hub")
     api = HfApi(token=args.hf_token)
-    idx = sum(f.endswith(".parquet") for f in api.list_repo_files(args.output_repo, repo_type="dataset"))
+    existing = api.list_repo_files(args.output_repo, repo_type="dataset")
+    idx = sum(f.endswith(".parquet") for f in existing)
+
     fname = f"data_{idx:05d}.parquet"
     Dataset.from_list(records).to_parquet(fname)
 
-    repo = Repository("repo_tmp", clone_from=args.output_repo, token=args.hf_token, repo_type="dataset")
+    repo = Repository("repo_tmp", clone_from=args.output_repo,
+                      token=args.hf_token, repo_type="dataset")
     repo.git_pull()
     repo.git_add(fname)
     repo.git_commit(f"add shard {idx}")
@@ -436,7 +467,7 @@ def gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
     dist.gather_object(local, gathered, dst=0)
     if rank == 0:
         merged: List[dict] = []
-        for part in gathered:        # type: ignore[arg-type]
+        for part in gathered:  # type: ignore[arg-type]
             merged.extend(part)
         push_shard(merged, args, dbg)
 
@@ -448,17 +479,17 @@ def gather_and_push(local: List[dict], args: Args, rank: int, world: int, dbg):
 
 def worker(args: Args):
     dist.init_process_group("nccl")
-    rank  = dist.get_rank()
+    rank = dist.get_rank()
     world = dist.get_world_size()
-    dbg   = get_logger(rank, args.debug)
+    dbg = get_logger(rank, args.debug)
 
     stop_evt = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
 
     try:
         engine = ReversePipelineEngine(args, rank, world, dbg)
-        tok    = AutoTokenizer.from_pretrained(args.model_name)
-        ds     = load_dataset(
+        tok = AutoTokenizer.from_pretrained(args.model_name)
+        ds = load_dataset(
             args.dataset_name,
             split=args.dataset_split,
             streaming=True,
@@ -479,14 +510,15 @@ def worker(args: Args):
 
             for i in range(len(input_ids)):
                 toks = input_ids[i].tolist()
-                while toks and toks[-1] == 0:      # strip right-pad
+                # strip right-padding (0)
+                while toks and toks[-1] == 0:
                     toks.pop()
 
                 seq_len = len(toks)
                 local_records.append(
                     {
                         "input_ids": toks,
-                        "sampled_ids":     ids[i][:seq_len],
+                        "sampled_ids": ids[i][:seq_len],
                         "sampled_counts": cnts[i][:seq_len],
                     }
                 )
@@ -498,7 +530,7 @@ def worker(args: Args):
                 local_records.clear()
                 seen = 0
 
-        # -------- Final flush ----------------------------------------- #
+        # ───── Final flush ───────────────────────────────────────────── #
         if local_records and not stop_evt.is_set():
             dbg("Final flush before exit")
             gather_and_push(local_records, args, rank, world, dbg)
