@@ -259,7 +259,7 @@ class ReversePipelineEngine:
         data_tag = self._data_tag(idx)
 
         # ---------- 1 · Rx / Tx packet ----------------------------------- #
-        first_pass_rank0 = self.rank == 0 and idx == 0
+        first_pass_rank0 = self.rank == 0 and (self.uid == 0 or idx == 0)
         if not first_pass_rank0:
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
             self._recv(shape, left, shape_tag)
@@ -293,7 +293,7 @@ class ReversePipelineEngine:
     def sample(self, input_ids: torch.Tensor) -> Tuple[list, list]:
         """Embed tokens then run through streamed blocks and lm_head."""
         # Step-unique UID guarantees isolated tag-space for this call.
-        dist.barrier()
+        dist.barrier(device_ids=[self.device.index])
         uid_this_call = self.uid
 
         # ---------- 1 · Embedding layer ---------------------------------- #
