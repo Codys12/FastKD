@@ -225,7 +225,7 @@ class ReversePipelineEngine:
             *model.model.layers,
             model.lm_head,
         ]
-
+        self.rotary_emb = model.model.rotary_emb
         # ---------- 2 · Buffers & global-tag helpers --------------------- #
         self.buffers = (FlatPacket(), FlatPacket())
         self.toggle = 0
@@ -300,6 +300,11 @@ class ReversePipelineEngine:
         self._stream_layer(0)
         embed = self.layers[0].to(self.device, non_blocking=True)
         hidden = embed(input_ids)
+        # ---- rotary position-embeddings (needed by Qwen3DecoderLayer) ---- #
+        seq_len = input_ids.size(1)
+        position_ids = (torch.arange(seq_len, device=self.device)
+                            .unsqueeze(0).expand_as(input_ids))
+        cos, sin = self.rotary_emb(hidden, position_ids)
         embed.to("cpu", non_blocking=True)
         torch.cuda.current_stream().synchronize()
 
@@ -309,9 +314,14 @@ class ReversePipelineEngine:
             layer = self.layers[idx].to(self.device, non_blocking=True)
 
             for start in range(0, hidden.size(0), self.args.micro_batch_size):
-                mb = hidden[start:start + self.args.micro_batch_size]
-                out = layer(mb)
-                hidden[start:start + self.args.micro_batch_size] = (
+                end = start + self.args.micro_batch_size
+                mb = hidden[start:end]
+                out = layer(
+                    mb,
+                    position_ids=position_ids[start:end],
+                    position_embeddings=(cos[start:end], sin[start:end]),
+                )
+                hidden[start:end] = (
                     out[0] if isinstance(out, tuple) else out)
 
             layer.to("cpu", non_blocking=True)
