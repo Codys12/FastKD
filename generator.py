@@ -259,7 +259,7 @@ class ReversePipelineEngine:
         data_tag = self._data_tag(idx)
 
         # ---------- 1 · Rx / Tx packet ----------------------------------- #
-        first_pass_rank0 = self.rank == 0 and (self.uid == 0 or idx == 0)
+        first_pass_rank0 = (self.rank == 0 and self.uid == 0)
         if not first_pass_rank0:
             shape = torch.empty(1, dtype=torch.int64, device=self.device)
             self._recv(shape, left, shape_tag)
