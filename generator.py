@@ -155,13 +155,21 @@ def build_sharded_model(args: Args,
     # Transformer blocks
     for i in range(n_layers):
         key = f"model.layers.{i}"
-        device_map[key] = device_str if start <= i < end else "meta"
+        if start <= i < end:
+            device_map[key] = device_str      # lives on *this* GPU
+        else:
+            device_map[key] = "disk"          # stays in .safetensors on disk
 
     # Embedding & head
     if rank == 0:
         device_map["model.embed_tokens"] = device_str
+    else:
+        device_map["model.embed_tokens"] = "disk"
+
     if rank == world - 1:
         device_map["lm_head"] = device_str
+    else:
+        device_map["lm_head"] = "disk"
 
     # ------------------------------------------------------------------ #
     # 3) Ensure checkpoint is local, then load only the shards we need   #
@@ -182,6 +190,7 @@ def build_sharded_model(args: Args,
         checkpoint=ckpt_dir,
         device_map=device_map,
         dtype=torch.bfloat16,
+        offload_state_dict=True,
         no_split_module_classes=[
             "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
             "MistralDecoderLayer", "BloomBlock"
