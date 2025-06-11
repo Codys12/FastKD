@@ -140,25 +140,29 @@ def build_sharded_model(args: Args,
 
     # ------------------------------------------------------------------ #
     # 2) Build per-rank device_map                                       #
+    #    accelerate / safetensors expect *ints* (GPU index) or strings   #
+    #    like "cuda:0" – **not** torch.device objects. Passing a         #
+    #    torch.device triggers:                                         #
+    #       safetensors_rust.SafetensorError: device cuda:X is invalid   #
     # ------------------------------------------------------------------ #
     per_stage = math.ceil(n_layers / world)
     start = rank * per_stage
     end   = min((rank + 1) * per_stage, n_layers)
 
-    # Default: keep weights on 'meta' (i.e. do not load here)
-    device_map: Dict[str, torch.device | str] = {"": "meta"}
+    device_idx = rank                       # 0 … world-1
+    device_map: Dict[str, int | str] = {"": "meta"}   # keep others as meta
     if rank == 0:
-        device_map["model.embed_tokens"] = device
+        device_map["model.embed_tokens"] = device_idx
     if rank == world - 1:
-        device_map["lm_head"] = device
+        device_map["lm_head"] = device_idx
     for i in range(start, end):
-        device_map[f"model.layers.{i}"] = device
+        device_map[f"model.layers.{i}"] = device_idx
 
     # ------------------------------------------------------------------ #
     # 3) Ensure checkpoint is local, then load only the shards we need   #
     # ------------------------------------------------------------------ #
     dbg("Resolving checkpoint locally (snapshot_download)")
-    ckpt_dir = snapshot_download(
+    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on cuda:{device_idx}")    ckpt_dir = snapshot_download(
         repo_id=args.model_name,
         token=args.hf_token,
         local_files_only=False,
