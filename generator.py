@@ -149,7 +149,7 @@ def build_sharded_model(args: Args,
     start = rank * per_stage
     end   = min((rank + 1) * per_stage, n_layers)
 
-    device_idx = rank                       # 0 … world-1
+    device_idx = rank  # 0 … world-1
     device_map: Dict[str, int | str] = {"": "meta"}   # keep others as meta
     if rank == 0:
         device_map["model.embed_tokens"] = device_idx
