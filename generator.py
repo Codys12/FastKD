@@ -145,9 +145,22 @@ class FlatPacket:
 
     def make_empty(self, numel: int, device: torch.device,
                    dtype: torch.dtype = torch.bfloat16):
-        # pin_memory because the tensor often travels host<->device
-        self.flat = torch.empty(numel, dtype=dtype,
-                                device=device, pin_memory=True)
+        """
+        Allocate an empty tensor to receive a flattened layer.
+
+        • If the target *device* is the CPU, we enable ``pin_memory`` so that
+          subsequent H→D copies are faster.
+        • If the target is already a CUDA device, requesting pinned memory
+          would raise ``RuntimeError: Only dense CPU tensors can be pinned``,
+          so we skip it.
+        """
+        pin = device.type == "cpu"
+        self.flat = torch.empty(
+            numel,
+            dtype=dtype,
+            device=device,
+            pin_memory=pin,
+        )
 
     # ............................... unpacking .............................. #
     def unpack_to(self, layer: torch.nn.Module):
