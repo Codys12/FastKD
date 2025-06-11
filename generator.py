@@ -132,7 +132,7 @@ def build_sharded_model(args: Args,
     end   = min((rank + 1) * per_stage, n_layers)
 
     # device_map tells Accelerate where each sub‑module should live
-    device_map: Dict[str, torch.device | str] = {"": "meta"}  # default
+    device_map: Dict[str, torch.device | str] = {"": "disk"}  # default
     # Embedding on rank‑0, lm_head on last rank
     if rank == 0:
         device_map["model.embed_tokens"] = device
