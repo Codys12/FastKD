@@ -162,7 +162,8 @@ def build_sharded_model(args: Args,
     # 3) Ensure checkpoint is local, then load only the shards we need   #
     # ------------------------------------------------------------------ #
     dbg("Resolving checkpoint locally (snapshot_download)")
-    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on cuda:{device_idx}")    ckpt_dir = snapshot_download(
+    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on cuda:{device_idx}")    
+    ckpt_dir = snapshot_download(
         repo_id=args.model_name,
         token=args.hf_token,
         local_files_only=False,
