@@ -115,19 +115,18 @@ def build_sharded_model(args: Args,
                         dbg):
     """
     Loads only the layer subset required for *this* rank on its GPU.
-    All other layers stay on meta tensors to avoid wasting memory.
+    All other layers stay on *meta* tensors so memory never spikes.
     """
-    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-
-    dbg("Building empty‑weight skeleton")
-    cfg = AutoConfig.from_pretrained(args.model_name)
+    dbg("Loading model config")
+    cfg = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     cfg.attn_implementation = "eager"         # safe everywhere
 
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(cfg)
-
-    layers: List[torch.nn.Module] = list(model.model.layers)
-    n_layers = len(layers)
+    # How many transformer blocks does the model have?
+    n_layers = getattr(cfg, "num_hidden_layers",
+                       getattr(cfg, "n_layer", None))
+    if n_layers is None:
+        raise ValueError("Could not determine the number of layers from the "
+                         "config – please file an issue for this model.")
     per_stage = math.ceil(n_layers / world)
     start = rank * per_stage
     end   = min((rank + 1) * per_stage, n_layers)
@@ -142,16 +141,15 @@ def build_sharded_model(args: Args,
     for i in range(start, end):
         device_map[f"model.layers.{i}"] = device
 
-    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on {device}")
-    model = load_checkpoint_and_dispatch(
-        model,
+    dbg(f"Loading model weights for layers [{start}, {end}) on {device}")
+    model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        device_map=device_map,
-        dtype=torch.bfloat16,
-        no_split_module_classes=[
-            "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
-            "MistralDecoderLayer", "BloomBlock"
-        ]
+        config=cfg,
+        device_map=device_map,      # our per‑rank shard
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,     # keep RAM footprint tiny
+        trust_remote_code=True,
+        token=args.hf_token,        # pass through gated‑repo token
     )
     model.eval()
     return model, start, end
