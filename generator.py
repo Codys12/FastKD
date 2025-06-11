@@ -145,16 +145,20 @@ def build_sharded_model(args: Args,
     #    torch.device triggers:                                         #
     #       safetensors_rust.SafetensorError: device cuda:X is invalid   #
     # ------------------------------------------------------------------ #
-    per_stage = math.ceil(n_layers / world)
-    start = rank * per_stage
-    end   = min((rank + 1) * per_stage, n_layers)
+    device_str = f"cuda:{rank}"
 
-    device_idx = rank  # 0 … world-1
-    device_map: Dict[str, int | str] = {"": "meta"}   # keep others as meta
+    device_map: Dict[str, str] = {"": "cpu"}              # root on CPU
+
+    # Transformer blocks
+    for i in range(n_layers):
+        key = f"model.layers.{i}"
+        device_map[key] = device_str if start <= i < end else "meta"
+
+    # Embedding & head
     if rank == 0:
-        device_map["model.embed_tokens"] = device_idx
+        device_map["model.embed_tokens"] = device_str
     if rank == world - 1:
-        device_map["lm_head"] = device_idx
+        device_map["lm_head"] = device_str
     for i in range(start, end):
         device_map[f"model.layers.{i}"] = device_idx
 
