@@ -115,7 +115,7 @@ def build_sharded_model(args: Args,
                         dbg):
     """
     Loads only the layer subset required for *this* rank on its GPU.
-    All other layers stay on *meta* tensors so memory never spikes.
+    All other layers stay as *meta* tensors so memory stays tiny.
     """
     dbg("Loading model config")
     cfg = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
@@ -125,15 +125,28 @@ def build_sharded_model(args: Args,
     n_layers = getattr(cfg, "num_hidden_layers",
                        getattr(cfg, "n_layer", None))
     if n_layers is None:
-        raise ValueError("Could not determine the number of layers from the "
-                         "config – please file an issue for this model.")
+        raise ValueError("Could not determine the number of layers – "
+                         "please file an issue for this model.")
+
+    # ------------------------------------------------------------------ #
+    # 1) Create an empty-weight skeleton (all params on 'meta')          #
+    # ------------------------------------------------------------------ #
+    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+    from huggingface_hub import snapshot_download
+
+    dbg("Building empty-weight skeleton")
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(cfg)
+
+    # ------------------------------------------------------------------ #
+    # 2) Build per-rank device_map                                       #
+    # ------------------------------------------------------------------ #
     per_stage = math.ceil(n_layers / world)
     start = rank * per_stage
     end   = min((rank + 1) * per_stage, n_layers)
 
-    # device_map tells Accelerate where each sub‑module should live
-    device_map: Dict[str, torch.device | str] = {"": "disk"}  # default
-    # Embedding on rank‑0, lm_head on last rank
+    # Default: keep weights on 'meta' (i.e. do not load here)
+    device_map: Dict[str, torch.device | str] = {"": "meta"}
     if rank == 0:
         device_map["model.embed_tokens"] = device
     if rank == world - 1:
@@ -141,185 +154,32 @@ def build_sharded_model(args: Args,
     for i in range(start, end):
         device_map[f"model.layers.{i}"] = device
 
-    dbg(f"Loading model weights for layers [{start}, {end}) on {device}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        config=cfg,
-        device_map=device_map,      # our per‑rank shard
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,     # keep RAM footprint tiny
-        trust_remote_code=True,
-        token=args.hf_token,        # pass through gated‑repo token
+    # ------------------------------------------------------------------ #
+    # 3) Ensure checkpoint is local, then load only the shards we need   #
+    # ------------------------------------------------------------------ #
+    dbg("Resolving checkpoint locally (snapshot_download)")
+    ckpt_dir = snapshot_download(
+        repo_id=args.model_name,
+        token=args.hf_token,
+        local_files_only=False,
+        # we only care about weight files; skip big tokenizer artefacts
+        ignore_patterns=["*.json", "*.txt", "*.md", "tokenizer.*"]
     )
+
+    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on {device}")
+    model = load_checkpoint_and_dispatch(
+        model,
+        checkpoint=ckpt_dir,
+        device_map=device_map,
+        dtype=torch.bfloat16,
+        no_split_module_classes=[
+            "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
+            "MistralDecoderLayer", "BloomBlock"
+        ],
+    )
+
     model.eval()
     return model, start, end
-
-###############################################################################
-# Pipeline engine (double‑buffered, inference‑only)                           #
-###############################################################################
-
-class PipelineEngine:
-    """
-    Standard left‑to‑right pipeline‑parallel execution with two micro‑batch
-    buffers (double buffering). For inference we only need the forward pass.
-    Each rank owns:
-        • rank 0          : embed + layers[start:end]
-        • 0 < rank < last : layers[start:end]
-        • last rank       : layers[start:end] + lm_head
-    """
-    def __init__(self, args: Args, rank: int, world: int, dbg):
-        self.args  = args
-        self.rank  = rank
-        self.world = world
-        self.dbg   = dbg
-
-        self.device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(self.device)
-
-        self.model, self.start, self.end = build_sharded_model(
-            args, rank, world, self.device, dbg
-        )
-
-        # References for convenience
-        self.layers = self.model.model.layers
-        self.embed  = self.model.model.embed_tokens if rank == 0 else None
-        self.head   = self.model.lm_head if rank == world - 1 else None
-        self.rotary = self.model.model.rotary_emb  # small, lives everywhere
-
-        # Buffers for double‑buffer micro‑batch scheduling
-        self.toggle = 0  # 0 or 1
-        self.streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-
-    # ........................ micro‑batch helpers .......................... #
-    def _tag(self, mb_idx: int) -> int:
-        # unique tag per micro‑batch wave (fits in 32 bits)
-        return mb_idx * 2
-
-    def _recv_hidden(self, shape, src, tag):
-        hidden = torch.empty(shape,
-                             dtype=torch.bfloat16,
-                             device=self.device)
-        req = dist.irecv(hidden, src=src, tag=tag)
-        return hidden, req
-
-    def _send_hidden(self, hidden, dst, tag):
-        return dist.isend(hidden, dst=dst, tag=tag)
-
-    # ........................ core pipeline step .......................... #
-    @torch.no_grad()
-    def pipeline_forward(self, batch: Optional[Dict[str, torch.Tensor]]) \
-            -> Tuple[List[list], List[list]]:
-        """
-        Executes one *global* batch consisting of
-            batch_size / micro_batch_size  micro‑batches.
-        Only *rank 0* receives real input tokens; other ranks receive/produce
-        activations through P2P communication.
-        Return value (ids, counts) is broadcast from the last rank so every
-        process can keep the original record‑construction logic unchanged.
-        """
-        micro_bs = self.args.micro_batch_size
-        B = batch["input_ids"].size(0) if self.rank == 0 else None
-        # Broadcast batch size so every rank knows how many micro‑batches
-        B_tensor = torch.tensor(B or 0, device=self.device)
-        dist.broadcast(B_tensor, src=0)
-        B = int(B_tensor.item())
-        num_mbs = math.ceil(B / micro_bs)
-
-        left  = (self.rank - 1) % self.world
-        right = (self.rank + 1) % self.world
-
-        # Per‑micro‑batch stash for last rank
-        ids_all, counts_all = [], []
-
-        # Two “slots” (double buffer) – iterate through a longer loop so
-        # that the pipeline fills and drains.
-        for wave in range(num_mbs + self.world - 1):
-            buf_idx = self.toggle
-            stream  = self.streams[buf_idx]
-            tag     = self._tag(buf_idx)
-
-            with torch.cuda.stream(stream):
-                # 1) Receive hidden from left neighbour  (if needed) – async
-                if self.rank != 0 and wave - (self.rank - 0) >= 0 \
-                        and wave < num_mbs + self.rank:
-                    # shape is unknown on non‑first wave – send shape tensor
-                    shape_tensor = torch.empty(2, dtype=torch.int64,
-                                               device=self.device)
-                    dist.recv(shape_tensor, src=left, tag=tag)
-                    shape = tuple(int(x) for x in shape_tensor.tolist())
-                    hidden, recv_req = self._recv_hidden(shape, left, tag)
-                else:
-                    hidden, recv_req = None, None
-
-                # 2) Prepare input on rank 0
-                if self.rank == 0 and wave < num_mbs:
-                    start = wave * micro_bs
-                    end   = min(start + micro_bs, B)
-                    input_ids = batch["input_ids"][start:end].to(self.device,
-                                                                 non_blocking=True)
-                    hidden = self.embed(input_ids)  # [mb, T, D]
-                    seq_len = input_ids.size(1)
-                    pos_ids = torch.arange(seq_len, device=self.device)\
-                                    .unsqueeze(0).expand_as(input_ids)
-                    cos, sin = self.rotary(hidden, pos_ids)
-                    # embed returns hidden already; rotary will be re‑done
-                    # inside transformer layers (models that need it)
-                else:
-                    # Wait for activations from previous stage
-                    if recv_req is not None:
-                        recv_req.wait()
-
-                # 3) Run local transformer block(s)
-                if hidden is not None and self.start < self.end:
-                    for layer_idx in range(self.start, self.end):
-                        layer = self.layers[layer_idx].to(self.device,
-                                                          non_blocking=True)
-                        # micro‑batch is small → single pass
-                        hidden = layer(hidden)[0] if isinstance(
-                            layer(hidden), tuple) else layer(hidden)
-
-                # 4) If *not* last rank, send hidden rightwards – async
-                if self.rank != self.world - 1 and hidden is not None:
-                    shape_tensor = torch.tensor(hidden.shape[:2],
-                                                dtype=torch.int64,
-                                                device=self.device)
-                    dist.isend(shape_tensor, dst=right, tag=tag)  # tiny sync
-                    self._send_hidden(hidden, right, tag)
-
-                # 5) If last rank we have full hidden – make logits + sample
-                if self.rank == self.world - 1 \
-                        and wave >= self.world - 1 and wave < num_mbs + self.world - 1:
-                    logits = self.head(hidden)[0]       # [mb, T, vocab]
-                    probs  = torch.softmax(
-                        logits / self.args.sampling_temperature, dim=-1)
-                    draws = torch.multinomial(
-                        probs.contiguous().view(-1, probs.size(-1)),
-                        self.args.num_samples * self.args.num_rounds,
-                        replacement=True
-                    ).view(*probs.shape[:-1], -1)
-
-                    for b in range(draws.size(0)):
-                        ids_seq, cnts_seq = [], []
-                        for t in range(draws.size(1)):
-                            uniq, cnt = torch.unique(draws[b, t],
-                                                     return_counts=True)
-                            ids_seq.append(uniq.cpu().tolist())
-                            cnts_seq.append(cnt.cpu().tolist())
-                        ids_all.append(ids_seq)
-                        counts_all.append(cnts_seq)
-
-            self.toggle ^= 1  # swap buffer
-
-        # ---------------- Broadcast sampled ids/cnts to every rank -------- #
-        if self.rank == self.world - 1:
-            payload: Tuple[list, list] = (ids_all, counts_all)
-        else:
-            payload = (None, None)
-        obj_list: List[object] = [payload]
-        dist.broadcast_object_list(obj_list, src=self.world - 1)
-        ids_all, counts_all = obj_list[0]
-
-        return ids_all, counts_all
 
 ###############################################################################
 # Push helpers (unchanged)                                                    #
