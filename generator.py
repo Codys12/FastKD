@@ -131,6 +131,9 @@ def build_sharded_model(args: Args,
     # ------------------------------------------------------------------ #
     # 1) Create an empty-weight skeleton (all params on 'meta')          #
     # ------------------------------------------------------------------ #
+    layers_per_rank = math.ceil(n_layers / world)
+    start = rank * layers_per_rank
+    end   = min(start + layers_per_rank, n_layers)
     from accelerate import init_empty_weights, load_checkpoint_and_dispatch
     from huggingface_hub import snapshot_download
 
@@ -159,8 +162,6 @@ def build_sharded_model(args: Args,
         device_map["model.embed_tokens"] = device_str
     if rank == world - 1:
         device_map["lm_head"] = device_str
-    for i in range(start, end):
-        device_map[f"model.layers.{i}"] = device_idx
 
     # ------------------------------------------------------------------ #
     # 3) Ensure checkpoint is local, then load only the shards we need   #
