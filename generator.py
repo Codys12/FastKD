@@ -175,7 +175,7 @@ def build_sharded_model(args: Args,
     # 3) Ensure checkpoint is local, then load only the shards we need   #
     # ------------------------------------------------------------------ #
     dbg("Resolving checkpoint locally (snapshot_download)")
-    dbg(f"Loading checkpoint shards for layers [{start}, {end})")    
+    dbg(f"Loading checkpoint shards for layers [{start}, {end})")
     ckpt_dir = snapshot_download(
         repo_id=args.model_name,
         token=args.hf_token,
@@ -185,12 +185,15 @@ def build_sharded_model(args: Args,
     )
 
     dbg(f"Loading checkpoint shards for layers [{start}, {end}) on {device}")
+    offload_dir = os.path.join(ckpt_dir, f"offload_rank{rank}")
+    os.makedirs(offload_dir, exist_ok=True)
     model = load_checkpoint_and_dispatch(
         model,
         checkpoint=ckpt_dir,
         device_map=device_map,
         dtype=torch.bfloat16,
         offload_state_dict=True,
+        offload_folder=offload_dir,
         no_split_module_classes=[
             "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
             "MistralDecoderLayer", "BloomBlock"
