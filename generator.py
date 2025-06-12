@@ -120,6 +120,7 @@ def build_sharded_model(args: Args,
     dbg("Loading model config")
     cfg = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     cfg.attn_implementation = "eager"         # safe everywhere
+    cfg.tie_word_embeddings = False
 
     # How many transformer blocks does the model have?
     n_layers = getattr(cfg, "num_hidden_layers",
