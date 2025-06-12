@@ -133,7 +133,7 @@ def main():
         args.model_name,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
-        device_map="auto",
+        device_map="balanced_low_0",
         trust_remote_code=args.trust_remote_code,
     )
     model.eval().requires_grad_(False)
