@@ -203,11 +203,6 @@ def build_sharded_model(args: Args,
         offload_state_dict=True,
         trust_remote_code=True,
         _fast_init=False,                     # fully defer weight init
-        no_split_module_classes=[             # never split a transformer block
-            "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
-            "MistralDecoderLayer", "BloomBlock",
-            "LlamaMoEBlock", "MixtralDecoderLayer",
-        ],
     )
     model.eval()
 
