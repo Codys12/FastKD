@@ -155,7 +155,7 @@ def main():
 
     if rank == 0:
         print(f"Loading dataset {args.dataset_name} …", file=sys.stderr)
-    ds = load_dataset(args.dataset_name, split="train", streaming=False)
+    ds = load_dataset(args.dataset_name, split="train", streaming=True)
     ds = ds.shuffle(seed=args.seed)  # reproducible
 
     def encode(batch: Dict[str, str]) -> Dict[str, List[int]]:
