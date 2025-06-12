@@ -77,26 +77,25 @@ def multinomial_gpu(
     probs: torch.Tensor, num_samples: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sample `num_samples` per row from a 2‑D probability tensor on‑GPU.
+    Sample `num_samples` tokens per row from a 2-D probability tensor on-GPU and
+    return both the raw samples (`tokenIds`) and a dense histogram (`counts`).
 
     Returns
     -------
     tokenIds : (rows, num_samples) int64
-    counts   : (rows, vocab)       int32  (sparse‑to‑dense via bincount)
+    counts   : (rows, vocab)       int32
     """
-    # sample ids
-    token_ids = torch.multinomial(
-        probs, num_samples=num_samples, replacement=True
-    )  # (rows, num_samples)
+    # Draw samples on-GPU
+    token_ids = torch.multinomial(probs, num_samples=num_samples, replacement=True)  # (R, k)
 
-    # histogram per row (dense); torch 2.3 supports multidim‑bincount in CUDA
-    counts = torch.zeros(
-        (*probs.shape), dtype=torch.int32, device=probs.device, requires_grad=False
-    )
-    for i in range(num_samples):
-        counts.scatter_add_(1, token_ids[:, i : i + 1], torch.ones_like(token_ids, dtype=torch.int32)[:, i : i + 1])
+    # Build dense histogram for each row in one shot
+    counts = torch.zeros(probs.shape, dtype=torch.int32, device=probs.device)
+    ones   = torch.ones_like(token_ids, dtype=torch.int32)
+    counts.scatter_add_(1, token_ids, ones)  # dim=1 (vocab)
 
+    # Move to CPU once, **after** aggregation
     return token_ids.cpu(), counts.cpu()
+
 
 
 def push_to_hub_cli(
