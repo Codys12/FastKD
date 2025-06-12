@@ -1,512 +1,344 @@
 #!/usr/bin/env python3
-# ring_kd_generator.py  –  June 2025  (v5.1 – fast loading + bug‑fix)
-#
-#   • True model sharding across GPUs (no weight movement)
-#   • 2‑way micro‑batch double buffering for steady‑state utilisation
-#   • Accelerate ≥ 0.27 required (fixes meta‑tensor bug)
-#
-# launch example:
-#   torchrun --nproc_per_node=8 ring_kd_generator.py \
-#            --model_name meta-llama/Meta-Llama-3-70B \
-#            --dataset_name c4 --output_repo my_user/c4-llama-kd
-#
-# NOTE: --offload_strategy is now a no‑op and kept for backwards compatibility
-# ---------------------------------------------------------------------------
+# generator.py
+"""
+Fast batched‑inference sampler for very‑large Transformer models on 8×H100.
+
+Example:
+  torchrun --nnodes 1 --nproc_per_node 8 generator.py \
+      --model_name Qwen/Qwen3-235B-A22B \
+      --dataset_name mlfoundations/dclm-baseline-1.0 \
+      --output_repo codys12/Qwen3-DCLM-test \
+      --hf_token  hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+      --batch_size 16 \
+      --num_rounds 255 \
+      --push_every 4096
+"""
 
 from __future__ import annotations
-import argparse, os, signal, sys, threading, traceback, math
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import argparse, json, math, os, subprocess, sys, tempfile, time
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-from packaging import version
 import torch
-import torch.distributed as dist
-from datasets import Dataset, load_dataset
-from huggingface_hub import HfApi, snapshot_download
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
 )
+from torch.distributed.fsdp.wrap import (
+    enable_wrap,
+    wrap,
+)
+from torch.distributed import init_process_group, barrier
+from torch.utils.data import DataLoader
 
-###############################################################################
-# CLI                                                                         #
-###############################################################################
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-@dataclass
-class Args:
-    model_name: str
-    dataset_name: str
-    dataset_split: str
-    output_repo: str
-    batch_size: int
-    micro_batch_size: int
-    num_rounds: int
-    num_samples: int
-    sampling_temperature: float
-    push_every: int
-    max_seq_len: int
-    offload_strategy: str          # <- kept but ignored
-    cache_dir: Optional[str]
-    hf_token: Optional[str] = None
-    debug: bool = False
+# Optional FP8 utilities (PyTorch 2.3 / NVIDIA transformer_engine >= 1.6)
+try:
+    from transformer_engine.pytorch.fp8_utils import FP8GlobalState, fp8_autocast
+    FP8_AVAILABLE = True
+except Exception:
+    FP8_AVAILABLE = False
 
 
-def parse_args() -> Args:
-    p = argparse.ArgumentParser("Pipeline‑parallel KD generator (v5.1)")
+# --------------------------------------------------------------------------- #
+# Helpers                                                                     #
+# --------------------------------------------------------------------------- #
+def setup_distributed() -> Tuple[int, int]:
+    """Initialise torch.distributed and return (rank, world_size)."""
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    init_process_group("nccl")
+    return torch.distributed.get_rank(), torch.distributed.get_world_size()
+
+
+def get_mixed_precision(fp8: bool) -> MixedPrecision:
+    """Return an appropriate MixedPrecision policy."""
+    if fp8 and FP8_AVAILABLE and torch.cuda.is_available():
+        policy = MixedPrecision(
+            param_dtype=torch.float8_e4m3fn,
+            reduce_dtype=torch.float8_e4m3fn,
+            buffer_dtype=torch.float8_e4m3fn,
+        )
+    else:
+        # default BF16 on Hopper; fall back to FP16 otherwise
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        policy = MixedPrecision(
+            param_dtype=dtype,
+            reduce_dtype=dtype,
+            buffer_dtype=dtype,
+        )
+    return policy
+
+
+def multinomial_gpu(
+    probs: torch.Tensor, num_samples: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample `num_samples` per row from a 2‑D probability tensor on‑GPU.
+
+    Returns
+    -------
+    tokenIds : (rows, num_samples) int64
+    counts   : (rows, vocab)       int32  (sparse‑to‑dense via bincount)
+    """
+    # sample ids
+    token_ids = torch.multinomial(
+        probs, num_samples=num_samples, replacement=True
+    )  # (rows, num_samples)
+
+    # histogram per row (dense); torch 2.3 supports multidim‑bincount in CUDA
+    counts = torch.zeros(
+        (*probs.shape), dtype=torch.int32, device=probs.device, requires_grad=False
+    )
+    for i in range(num_samples):
+        counts.scatter_add_(1, token_ids[:, i : i + 1], torch.ones_like(token_ids, dtype=torch.int32)[:, i : i + 1])
+
+    return token_ids.cpu(), counts.cpu()
+
+
+def push_to_hub_cli(
+    repo: str,
+    hf_token: str,
+    local_file: Path,
+    remote_path: str,
+    commit_msg: str,
+) -> None:
+    """Upload a single file to the Hub using huggingface‑cli."""
+    env = os.environ.copy()
+    env["HF_TOKEN"] = hf_token
+    cmd = [
+        "huggingface-cli",
+        "upload",
+        repo,
+        str(local_file),
+        "--path_in_repo",
+        remote_path,
+        "-m",
+        commit_msg,
+    ]
+    subprocess.check_call(cmd, env=env)
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                        #
+# --------------------------------------------------------------------------- #
+def main():
+    p = argparse.ArgumentParser()
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
-    p.add_argument("--dataset_split", default="train")
     p.add_argument("--output_repo", required=True)
+    p.add_argument("--hf_token", required=True)
+    p.add_argument("--push_every", type=int, default=4096)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--micro_batch_size", type=int, default=1)
-    p.add_argument("--num_rounds", type=int, default=50)
-    p.add_argument("--num_samples", type=int, default=1)
-    p.add_argument("--sampling_temperature", type=float, default=1.0)
-    p.add_argument("--push_every", type=int, default=1_000)
-    p.add_argument("--max_seq_len", type=int, default=2_048)
-    p.add_argument("--offload_strategy", default="none",
-                   help="NO‑OP – kept for script compatibility")
-    p.add_argument("--cache_dir", default=None,
-                   help="Optional HF cache override")
-    p.add_argument("--hf_token", default=None)
-    p.add_argument("--debug", action="store_true")
-    return Args(**vars(p.parse_args()))
+    p.add_argument("--num_rounds", type=int, default=1)
+    p.add_argument("--num_samples", type=int, default=50)
+    p.add_argument("--fp8", action="store_true")
+    p.add_argument("--precision_compile", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
 
-###############################################################################
-# Utils                                                                       #
-###############################################################################
+    torch.manual_seed(args.seed)
 
-def get_logger(rank: int, enabled: bool):
-    def log(msg: str):
-        if enabled:
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"[{ts} | r{rank}] {msg}", flush=True)
-    return log
+    rank, world_size = setup_distributed()
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
 
-
-def _pin_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            batch[k] = v.pin_memory()
-    return batch
-
-
-def collate_fn(examples, tok, max_len):
-    enc = tok([e["text"] for e in examples],
-              return_tensors="pt",
-              padding=True,
-              truncation=True,
-              max_length=max_len)
-    return _pin_batch(enc)
-
-
-def stream_loader(ds, tok, bs, max_len):
-    buf = []
-    for ex in ds:
-        buf.append(ex)
-        if len(buf) == bs:
-            yield collate_fn(buf, tok, max_len)
-            buf.clear()
-    if buf:
-        yield collate_fn(buf, tok, max_len)
-
-###############################################################################
-# Model partitioning helper                                                   #
-###############################################################################
-
-def build_sharded_model(args: Args,
-                        rank: int,
-                        world: int,
-                        device: torch.device,
-                        dbg):
-    """
-    Loads only the layer subset required for *this* rank on its GPU.
-    All other layers stay on disk / CPU to keep memory tiny.
-    """
-
-    # ------------------------------------------------------------------ #
-    # 0)  Sanity‑check Accelerate version                                #
-    # ------------------------------------------------------------------ #
-    import accelerate
-    if version.parse(accelerate.__version__) < version.parse("0.27.0"):
-        raise RuntimeError(
-            f"Accelerate ≥ 0.27.0 is required "
-            f"(you have {accelerate.__version__}). "
-            f"`pip install -U accelerate` fixes the meta‑tensor bug."
-        )
-
-    # ------------------------------------------------------------------ #
-    # 1)  Model config (needed for skeleton & device map)                #
-    # ------------------------------------------------------------------ #
-    cfg = AutoConfig.from_pretrained(
-        args.model_name,
-        trust_remote_code=True,
-        cache_dir=args.cache_dir,
-    )
-    cfg.attn_implementation = "eager"         # safe everywhere
-    cfg.tie_word_embeddings = False
-
-    n_layers = getattr(cfg, "num_hidden_layers",
-                       getattr(cfg, "n_layer", None))
-    if n_layers is None:
-        raise ValueError("Could not determine the number of layers – "
-                         "please file an issue for this model.")
-
-    layers_per_rank = math.ceil(n_layers / world)
-    start = rank * layers_per_rank
-    end   = min(start + layers_per_rank, n_layers)
-
-    # ------------------------------------------------------------------ #
-    # 2)  Build device map                                               #
-    # ------------------------------------------------------------------ #
-    device_str = f"cuda:{rank}"
-    device_map: Dict[str, str] = {"": "cpu"}       # root on CPU
-
-    # Transformer blocks
-    for i in range(n_layers):
-        key = f"model.layers.{i}"
-        device_map[key] = device_str if start <= i < end else "disk"
-
-    # Embedding & head
-    device_map["model.embed_tokens"] = device_str if rank == 0 else "disk"
-    device_map["lm_head"]           = device_str if rank == world - 1 else "disk"
-
-    dbg(f"Layers on this GPU: {list(range(start, end))}")
-
-    # ------------------------------------------------------------------ #
-    # 3)  Resolve checkpoint (cached after first run)                    #
-    # ------------------------------------------------------------------ #
-    ckpt_dir = snapshot_download(
-        repo_id=args.model_name,
-        token=args.hf_token,
-        cache_dir=args.cache_dir,
-        resume_download=True,                 # speeds up subsequent runs
-        ignore_patterns=["*.json", "*.txt", "*.md", "tokenizer.*"]
-    )
-
-    offload_dir = os.path.join(ckpt_dir, f"offload_rank{rank}")
-    os.makedirs(offload_dir, exist_ok=True)
-
-    # ------------------------------------------------------------------ #
-    # 4)  One‑liner: create + materialise only required weights          #
-    # ------------------------------------------------------------------ #
-    dbg("Instantiating sharded model")
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt_dir,
-        config=cfg,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,               # skeleton on meta
-        device_map=device_map,
-        offload_folder=offload_dir,
-        offload_state_dict=True,
-        trust_remote_code=True,
-        _fast_init=False,                     # fully defer weight init
-    )
-    model.eval()
-
-    return model, start, end
-
-###############################################################################
-# Pipeline engine (double‑buffered, inference‑only)                           #
-###############################################################################
-
-class PipelineEngine:
-    """
-    Standard left‑to‑right pipeline‑parallel execution with two micro‑batch
-    buffers (double buffering). For inference we only need the forward pass.
-    Each rank owns:
-        • rank 0          : embed + layers[start:end]
-        • 0 < rank < last : layers[start:end]
-        • last rank       : layers[start:end] + lm_head
-    """
-    def __init__(self, args: Args, rank: int, world: int, dbg):
-        self.args  = args
-        self.rank  = rank
-        self.world = world
-        self.dbg   = dbg
-
-        self.device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(self.device)
-
-        self.model, self.start, self.end = build_sharded_model(
-            args, rank, world, self.device, dbg
-        )
-
-        # References for convenience
-        self.layers = self.model.model.layers
-        self.embed  = self.model.model.embed_tokens if rank == 0 else None
-        self.head   = self.model.lm_head           if rank == world - 1 else None
-        # rotary embedding helper (models that do not expose it just ignore)
-        self.rotary = getattr(self.model.model, "rotary_emb", None)
-
-        # Buffers for double‑buffer micro‑batch scheduling
-        self.toggle = 0  # 0 or 1
-        self.streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-
-    # ........................ micro‑batch helpers .......................... #
-    def _tag(self, mb_idx: int) -> int:
-        # unique tag per micro‑batch wave (fits in 32 bits)
-        return mb_idx * 2
-
-    def _recv_hidden(self, shape, src, tag):
-        hidden = torch.empty(shape,
-                             dtype=torch.bfloat16,
-                             device=self.device)
-        req = dist.irecv(hidden, src=src, tag=tag)
-        return hidden, req
-
-    def _send_hidden(self, hidden, dst, tag):
-        return dist.isend(hidden, dst=dst, tag=tag)
-
-    # ........................ core pipeline step .......................... #
-    @torch.no_grad()
-    def pipeline_forward(self, batch: Optional[Dict[str, torch.Tensor]]) \
-            -> Tuple[List[list], List[list]]:
-        """
-        Executes one *global* batch consisting of
-            batch_size / micro_batch_size  micro‑batches.
-        Only *rank 0* receives real input tokens; other ranks receive/produce
-        activations through P2P communication.
-        Return value (ids, counts) is broadcast from the last rank so every
-        process can keep the original record‑construction logic unchanged.
-        """
-        micro_bs = self.args.micro_batch_size
-        B = batch["input_ids"].size(0) if self.rank == 0 else None
-        # Broadcast batch size so every rank knows how many micro‑batches
-        B_tensor = torch.tensor(B or 0, device=self.device)
-        dist.broadcast(B_tensor, src=0)
-        B = int(B_tensor.item())
-        num_mbs = math.ceil(B / micro_bs)
-
-        left  = (self.rank - 1) % self.world
-        right = (self.rank + 1) % self.world
-
-        # Per‑micro‑batch stash for last rank
-        ids_all, counts_all = [], []
-
-        # Two “slots” (double buffer) – iterate through a longer loop so
-        # that the pipeline fills and drains.
-        for wave in range(num_mbs + self.world - 1):
-            buf_idx = self.toggle
-            stream  = self.streams[buf_idx]
-            tag     = self._tag(buf_idx)
-
-            with torch.cuda.stream(stream):
-                # 1) Receive hidden from left neighbour  (if needed) – async
-                if self.rank != 0 and wave - (self.rank - 0) >= 0 \
-                        and wave < num_mbs + self.rank:
-                    # shape is unknown on non‑first wave – send shape tensor
-                    shape_tensor = torch.empty(2, dtype=torch.int64,
-                                               device=self.device)
-                    dist.recv(shape_tensor, src=left, tag=tag)
-                    shape = tuple(int(x) for x in shape_tensor.tolist())
-                    hidden, recv_req = self._recv_hidden(shape, left, tag)
-                else:
-                    hidden, recv_req = None, None
-
-                # 2) Prepare input on rank 0
-                if self.rank == 0 and wave < num_mbs:
-                    start_idx = wave * micro_bs
-                    end_idx   = min(start_idx + micro_bs, B)
-                    input_ids = batch["input_ids"][start_idx:end_idx]\
-                                      .to(self.device, non_blocking=True)
-                    hidden = self.embed(input_ids)  # [mb, T, D]
-
-                    if self.rotary is not None:
-                        seq_len = input_ids.size(1)
-                        pos_ids = torch.arange(seq_len,
-                                               device=self.device)\
-                                        .unsqueeze(0).expand_as(input_ids)
-                        self.rotary(hidden, pos_ids)  # in‑place
-
-                else:
-                    # Wait for activations from previous stage
-                    if recv_req is not None:
-                        recv_req.wait()
-
-                # 3) Run local transformer block(s)
-                if hidden is not None and self.start < self.end:
-                    for layer_idx in range(self.start, self.end):
-                        layer = self.layers[layer_idx]
-                        hidden = layer(hidden)[0] if isinstance(
-                            layer(hidden), tuple) else layer(hidden)
-
-                # 4) If *not* last rank, send hidden rightwards – async
-                if self.rank != self.world - 1 and hidden is not None:
-                    shape_tensor = torch.tensor(hidden.shape[:2],
-                                                dtype=torch.int64,
-                                                device=self.device)
-                    dist.isend(shape_tensor, dst=right, tag=tag)  # tiny sync
-                    self._send_hidden(hidden, right, tag)
-
-                # 5) If last rank we have full hidden – make logits + sample
-                if self.rank == self.world - 1 \
-                        and wave >= self.world - 1 \
-                        and wave < num_mbs + self.world - 1:
-                    logits = self.head(hidden)[0]       # [mb, T, vocab]
-                    probs  = torch.softmax(
-                        logits / self.args.sampling_temperature, dim=-1)
-                    draws = torch.multinomial(
-                        probs.contiguous().view(-1, probs.size(-1)),
-                        self.args.num_samples * self.args.num_rounds,
-                        replacement=True
-                    ).view(*probs.shape[:-1], -1)
-
-                    for b in range(draws.size(0)):
-                        ids_seq, cnts_seq = [], []
-                        for t in range(draws.size(1)):
-                            uniq, cnt = torch.unique(draws[b, t],
-                                                     return_counts=True)
-                            ids_seq.append(uniq.cpu().tolist())
-                            cnts_seq.append(cnt.cpu().tolist())
-                        ids_all.append(ids_seq)
-                        counts_all.append(cnts_seq)
-
-            self.toggle ^= 1  # swap buffer
-
-        # ---------------- Broadcast sampled ids/cnts to every rank -------- #
-        if self.rank == self.world - 1:
-            payload: Tuple[list, list] = (ids_all, counts_all)
-        else:
-            payload = (None, None)
-        obj_list: List[object] = [payload]
-        dist.broadcast_object_list(obj_list, src=self.world - 1)
-        ids_all, counts_all = obj_list[0]
-
-        return ids_all, counts_all
-
-###############################################################################
-# Push helpers (unchanged)                                                    #
-###############################################################################
-
-def push_shard(records: List[dict], args: Args, dbg):
-    dbg(f"Pushing {len(records):,d} records to hub")
-    api = HfApi(token=args.hf_token)
-    existing = api.list_repo_files(args.output_repo, repo_type="dataset")
-    idx = sum(f.endswith(".parquet") for f in existing)
-
-    fname = f"data_{idx:05d}.parquet"
-    Dataset.from_list(records).to_parquet(fname)
-
-    from huggingface_hub import CommitOperationAdd
-    api.create_repo(args.output_repo, repo_type="dataset", exist_ok=True)
-    ops = [CommitOperationAdd(path_in_repo=fname, path_or_fileobj=fname)]
-    api.create_commit(args.output_repo, repo_type="dataset",
-                      operations=ops,
-                      commit_message=f"add shard {idx}")
-    os.remove(fname)
-
-
-def gather_and_push(local: List[dict], args: Args,
-                    rank: int, world: int, dbg):
-    gathered = [None] * world if rank == 0 else None
-    dist.gather_object(local, gathered, dst=0)
+    # --------------------------------------------------------------------- #
+    # Load tokenizer & dataset (CPU)                                        #
+    # --------------------------------------------------------------------- #
     if rank == 0:
-        merged: List[dict] = []
-        for part in gathered:            # type: ignore[arg-type]
-            merged.extend(part)
-        push_shard(merged, args, dbg)
+        print(f"Loading tokenizer {args.model_name} …", file=sys.stderr)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tokenizer.pad_token = tokenizer.eos_token
 
-###############################################################################
-# Worker                                                                      #
-###############################################################################
+    if rank == 0:
+        print(f"Loading dataset {args.dataset_name} …", file=sys.stderr)
+    ds = load_dataset(args.dataset_name, split="train", streaming=False)
+    ds = ds.shuffle(seed=args.seed)  # reproducible
 
-def worker(args: Args):
-    dist.init_process_group("nccl")
-    rank, world = dist.get_rank(), dist.get_world_size()
-    dbg = get_logger(rank, args.debug)
-
-    stop_evt = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
-
-    try:
-        engine = PipelineEngine(args, rank, world, dbg)
-
-        tok = AutoTokenizer.from_pretrained(
-            args.model_name,
-            cache_dir=args.cache_dir,
-            token=args.hf_token,
+    def encode(batch: Dict[str, str]) -> Dict[str, List[int]]:
+        ids = tokenizer(
+            batch["text"],
+            truncation=True,
+            padding="longest",
+            return_tensors="pt",
         )
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
+        return {"input_ids": ids.input_ids.squeeze(0)}  # streaming=False
 
-        # Only rank‑0 reads the dataset; all others just run the pipeline
-        if rank == 0:
-            ds = load_dataset(args.dataset_name,
-                              split=args.dataset_split,
-                              streaming=True,
-                              token=args.hf_token)
-            loader = stream_loader(ds, tok, args.batch_size, args.max_seq_len)
-        else:
-            loader = None  # type: ignore[assignment]
+    ds = ds.map(encode, remove_columns=ds.column_names, num_proc=8)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=lambda items: {
+            "input_ids": torch.nn.utils.rnn.pad_sequence(
+                [item["input_ids"] for item in items],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+        },
+    )
 
-        local_records: List[dict] = []
-        seen = 0
+    # --------------------------------------------------------------------- #
+    # Model (FSDP)                                                          #
+    # --------------------------------------------------------------------- #
+    if rank == 0:
+        print(f"Loading model {args.model_name} …", file=sys.stderr)
 
-        batch_idx = 0
-        while True:
-            if stop_evt.is_set():
-                dbg("SIGTERM received – breaking loop")
-                break
+    policy = get_mixed_precision(args.fp8)
 
-            # Rank 0 fetches the next batch; other ranks pass dummy
-            batch = next(loader, None) if rank == 0 else None
-            # Broadcast a “continue / stop” flag – 1 if more data, 0 otherwise
-            more_flag = torch.tensor(1 if batch is not None else 0,
-                                     dtype=torch.int8,
-                                     device=engine.device)
-            dist.broadcast(more_flag, src=0)
-            if more_flag.item() == 0:
-                break
+    with enable_wrap(
+        wrapper_cls=FSDP,
+        mixed_precision=policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+    ):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=policy.param_dtype,
+            device_map=None,  # handled by FSDP
+            low_cpu_mem_usage=True,
+        )
+        model.eval()
+        # force no‑kv cache
+        model.config.use_cache = False
 
-            dbg(f"Batch {batch_idx}")
-            ids, cnts = engine.pipeline_forward(batch)
-            if rank == 0:
-                input_ids = batch["input_ids"]
-                for i in range(len(input_ids)):
-                    toks = input_ids[i].tolist()
-                    while toks and toks[-1] == tok.pad_token_id:
-                        toks.pop()
-                    seq_len = len(toks)
-                    local_records.append({
-                        "input_ids": toks,
-                        "sampled_ids": ids[i][:seq_len],
-                        "sampled_counts": cnts[i][:seq_len],
-                    })
-                seen += len(input_ids)
+        fsdp_model = wrap(model)
 
-                if seen >= args.push_every:
-                    dbg("push_every reached – gathering to rank‑0")
-                    gather_and_push(local_records, args, rank, world, dbg)
-                    local_records.clear()
-                    seen = 0
+    if args.precision_compile:
+        fsdp_model = torch.compile(fsdp_model)
 
-            batch_idx += 1
+    # --------------------------------------------------------------------- #
+    # Sampler loop                                                          #
+    # --------------------------------------------------------------------- #
+    samples_in_shard = 0
+    shard_idx = 0
+    tmp_dir = Path(tempfile.mkdtemp(prefix="shard_", dir="/tmp" if os.path.exists("/tmp") else "."))
 
-        # Final flush
-        if rank == 0 and local_records:
-            dbg("Final flush")
-            gather_and_push(local_records, args, rank, world, dbg)
+    # Check what index we should start at (idempotency)
+    if rank == 0:
+        from huggingface_hub import list_repo_files, HfApi
+        api = HfApi(token=args.hf_token)
+        try:
+            existing_files = list_repo_files(args.output_repo, repo_type="dataset", token=args.hf_token)
+            shard_idx = (
+                max(
+                    [
+                        int(f.split("_")[1].split(".")[0])
+                        for f in existing_files
+                        if f.startswith("shard_") and f.endswith(".jsonl")
+                    ],
+                    default=-1,
+                )
+                + 1
+            )
+        except Exception:
+            # Repo may not exist yet; will be created on first push
+            shard_idx = 0
+    shard_idx = int(torch.tensor(shard_idx).to(device))
+    # broadcast so all ranks agree
+    torch.distributed.broadcast(shard_idx, src=0)
+    shard_idx = shard_idx.item()
 
-    except Exception:
-        dbg("Unhandled exception – printing traceback")
-        traceback.print_exc()
-        dist.destroy_process_group()
-        sys.exit(1)
+    local_rows: List[str] = []
 
-    dbg("Graceful shutdown")
-    dist.destroy_process_group()
+    for round_ in range(args.num_rounds):
+        for step, batch in enumerate(dl):
+            batch_ids = batch["input_ids"].to(device, non_blocking=True)
 
-###############################################################################
-# Entry‑point                                                                 #
-###############################################################################
+            with (
+                fp8_autocast(enabled=args.fp8) if (args.fp8 and FP8_AVAILABLE) else torch.no_grad()
+            ):
+                with torch.no_grad():
+                    logits = fsdp_model(batch_ids).logits  # (B, L, V)
 
-def main():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    args = parse_args()
-    worker(args)
+            B, L, V = logits.shape
+            logits = logits.view(-1, V)  # rows = B*L
+            probs = torch.softmax(logits, dim=-1)
+
+            token_ids, counts = multinomial_gpu(probs, args.num_samples)  # CPU tensors
+
+            # serialise rows
+            counts_list = counts.tolist()
+            tokens_list = token_ids.tolist()
+
+            for row in range(len(tokens_list)):
+                payload = {
+                    "round": round_,
+                    "global_row": round_ * len(dl) * B * L + step * B * L + row,
+                    "tokenIds": tokens_list[row],
+                    "counts": counts_list[row],
+                }
+                local_rows.append(json.dumps(payload) + "\n")
+
+            samples_in_shard += len(tokens_list)
+
+            # ------------------------------------------------------------------ #
+            # PUSH IF NEEDED (rank 0 only)                                       #
+            # ------------------------------------------------------------------ #
+            if samples_in_shard >= args.push_every:
+                # Gather rows from all ranks to rank 0
+                gathered = [None for _ in range(world_size)]
+                torch.distributed.gather_object(local_rows, gathered, dst=0)
+
+                if rank == 0:
+                    # Flatten & write to shard file
+                    shard_path = tmp_dir / f"shard_{shard_idx:06d}.jsonl"
+                    with open(shard_path, "w") as fh:
+                        for chunk in gathered:
+                            for ln in chunk:
+                                fh.write(ln)
+                    # push
+                    remote_path = shard_path.name
+                    commit_msg = f"Add {remote_path} ({samples_in_shard} rows)"
+                    push_to_hub_cli(
+                        args.output_repo,
+                        args.hf_token,
+                        shard_path,
+                        remote_path,
+                        commit_msg,
+                    )
+                    shard_idx += 1
+                    print(f"Pushed {remote_path} ✔️", file=sys.stderr)
+
+                # everyone waits
+                barrier()
+
+                # reset local buffer
+                local_rows.clear()
+                samples_in_shard = 0
+
+    # --------------------------------------------------------------------- #
+    # Final flush                                                           #
+    # --------------------------------------------------------------------- #
+    gathered = [None for _ in range(world_size)]
+    torch.distributed.gather_object(local_rows, gathered, dst=0)
+
+    if rank == 0 and any(gathered):
+        shard_path = tmp_dir / f"shard_{shard_idx:06d}.jsonl"
+        with open(shard_path, "w") as fh:
+            for chunk in gathered:
+                for ln in chunk:
+                    fh.write(ln)
+        remote_path = shard_path.name
+        push_to_hub_cli(
+            args.output_repo,
+            args.hf_token,
+            shard_path,
+            remote_path,
+            f"Add {remote_path} (final)",
+        )
+        print(f"Pushed {remote_path} ✔️ (final)", file=sys.stderr)
+
+    barrier()
+    if rank == 0:
+        print("✓ All done", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
