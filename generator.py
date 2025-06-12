@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-# ring_kd_generator.py  –  June 2025, pipeline‑parallel rewrite
+# ring_kd_generator.py  –  June 2025  (v5.1 – fast loading + bug‑fix)
 #
 #   • True model sharding across GPUs (no weight movement)
 #   • 2‑way micro‑batch double buffering for steady‑state utilisation
-#   • Same CLI and sampling / Hub‑push semantics as the v4 “ring” script
+#   • Accelerate ≥ 0.27 required (fixes meta‑tensor bug)
 #
 # launch example:
 #   torchrun --nproc_per_node=8 ring_kd_generator.py \
-#            --model_name meta‑llama/Meta‑Llama‑3‑70B \
-#            --dataset_name c4 --output_repo my_user/c4‑llama‑kd
+#            --model_name meta-llama/Meta-Llama-3-70B \
+#            --dataset_name c4 --output_repo my_user/c4-llama-kd
 #
 # NOTE: --offload_strategy is now a no‑op and kept for backwards compatibility
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
-import argparse, os, signal, sys, threading, traceback, math, inspect
+import argparse, os, signal, sys, threading, traceback, math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
+from packaging import version
 import torch
 import torch.distributed as dist
 from datasets import Dataset, load_dataset
-from huggingface_hub import HfApi
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer)
+from huggingface_hub import HfApi, snapshot_download
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
 
 ###############################################################################
 # CLI                                                                         #
@@ -43,12 +48,13 @@ class Args:
     push_every: int
     max_seq_len: int
     offload_strategy: str          # <- kept but ignored
+    cache_dir: Optional[str]
     hf_token: Optional[str] = None
     debug: bool = False
 
 
 def parse_args() -> Args:
-    p = argparse.ArgumentParser("Pipeline‑parallel KD generator (v5)")
+    p = argparse.ArgumentParser("Pipeline‑parallel KD generator (v5.1)")
     p.add_argument("--model_name", required=True)
     p.add_argument("--dataset_name", required=True)
     p.add_argument("--dataset_split", default="train")
@@ -58,10 +64,12 @@ def parse_args() -> Args:
     p.add_argument("--num_rounds", type=int, default=50)
     p.add_argument("--num_samples", type=int, default=1)
     p.add_argument("--sampling_temperature", type=float, default=1.0)
-    p.add_argument("--push_every", type=int, default=1000)
-    p.add_argument("--max_seq_len", type=int, default=2048)
+    p.add_argument("--push_every", type=int, default=1_000)
+    p.add_argument("--max_seq_len", type=int, default=2_048)
     p.add_argument("--offload_strategy", default="none",
                    help="NO‑OP – kept for script compatibility")
+    p.add_argument("--cache_dir", default=None,
+                   help="Optional HF cache override")
     p.add_argument("--hf_token", default=None)
     p.add_argument("--debug", action="store_true")
     return Args(**vars(p.parse_args()))
@@ -115,93 +123,94 @@ def build_sharded_model(args: Args,
                         dbg):
     """
     Loads only the layer subset required for *this* rank on its GPU.
-    All other layers stay as *meta* tensors so memory stays tiny.
+    All other layers stay on disk / CPU to keep memory tiny.
     """
-    dbg("Loading model config")
-    cfg = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+
+    # ------------------------------------------------------------------ #
+    # 0)  Sanity‑check Accelerate version                                #
+    # ------------------------------------------------------------------ #
+    import accelerate
+    if version.parse(accelerate.__version__) < version.parse("0.27.0"):
+        raise RuntimeError(
+            f"Accelerate ≥ 0.27.0 is required "
+            f"(you have {accelerate.__version__}). "
+            f"`pip install -U accelerate` fixes the meta‑tensor bug."
+        )
+
+    # ------------------------------------------------------------------ #
+    # 1)  Model config (needed for skeleton & device map)                #
+    # ------------------------------------------------------------------ #
+    cfg = AutoConfig.from_pretrained(
+        args.model_name,
+        trust_remote_code=True,
+        cache_dir=args.cache_dir,
+    )
     cfg.attn_implementation = "eager"         # safe everywhere
     cfg.tie_word_embeddings = False
 
-    # How many transformer blocks does the model have?
     n_layers = getattr(cfg, "num_hidden_layers",
                        getattr(cfg, "n_layer", None))
     if n_layers is None:
         raise ValueError("Could not determine the number of layers – "
                          "please file an issue for this model.")
 
-    # ------------------------------------------------------------------ #
-    # 1) Create an empty-weight skeleton (all params on 'meta')          #
-    # ------------------------------------------------------------------ #
     layers_per_rank = math.ceil(n_layers / world)
     start = rank * layers_per_rank
     end   = min(start + layers_per_rank, n_layers)
-    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-    from huggingface_hub import snapshot_download
-
-    dbg("Building empty-weight skeleton")
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(cfg)
 
     # ------------------------------------------------------------------ #
-    # 2) Build per-rank device_map                                       #
-    #    accelerate / safetensors expect *ints* (GPU index) or strings   #
-    #    like "cuda:0" – **not** torch.device objects. Passing a         #
-    #    torch.device triggers:                                         #
-    #       safetensors_rust.SafetensorError: device cuda:X is invalid   #
+    # 2)  Build device map                                               #
     # ------------------------------------------------------------------ #
     device_str = f"cuda:{rank}"
-
-    device_map: Dict[str, str] = {"": "cpu"}              # root on CPU
+    device_map: Dict[str, str] = {"": "cpu"}       # root on CPU
 
     # Transformer blocks
     for i in range(n_layers):
         key = f"model.layers.{i}"
-        if start <= i < end:
-            device_map[key] = device_str      # lives on *this* GPU
-        else:
-            device_map[key] = "disk"          # stays in .safetensors on disk
+        device_map[key] = device_str if start <= i < end else "disk"
 
     # Embedding & head
-    if rank == 0:
-        device_map["model.embed_tokens"] = device_str
-    else:
-        device_map["model.embed_tokens"] = "disk"
+    device_map["model.embed_tokens"] = device_str if rank == 0 else "disk"
+    device_map["lm_head"]           = device_str if rank == world - 1 else "disk"
 
-    if rank == world - 1:
-        device_map["lm_head"] = device_str
-    else:
-        device_map["lm_head"] = "disk"
+    dbg(f"Layers on this GPU: {list(range(start, end))}")
 
     # ------------------------------------------------------------------ #
-    # 3) Ensure checkpoint is local, then load only the shards we need   #
+    # 3)  Resolve checkpoint (cached after first run)                    #
     # ------------------------------------------------------------------ #
-    dbg("Resolving checkpoint locally (snapshot_download)")
-    dbg(f"Loading checkpoint shards for layers [{start}, {end})")
     ckpt_dir = snapshot_download(
         repo_id=args.model_name,
         token=args.hf_token,
-        local_files_only=False,
-        # we only care about weight files; skip big tokenizer artefacts
+        cache_dir=args.cache_dir,
+        resume_download=True,                 # speeds up subsequent runs
         ignore_patterns=["*.json", "*.txt", "*.md", "tokenizer.*"]
     )
 
-    dbg(f"Loading checkpoint shards for layers [{start}, {end}) on {device}")
     offload_dir = os.path.join(ckpt_dir, f"offload_rank{rank}")
     os.makedirs(offload_dir, exist_ok=True)
-    model = load_checkpoint_and_dispatch(
-        model,
-        checkpoint=ckpt_dir,
+
+    # ------------------------------------------------------------------ #
+    # 4)  One‑liner: create + materialise only required weights          #
+    # ------------------------------------------------------------------ #
+    dbg("Instantiating sharded model")
+    model = AutoModelForCausalLM.from_pretrained(
+        ckpt_dir,
+        config=cfg,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,               # skeleton on meta
         device_map=device_map,
-        dtype=torch.bfloat16,
-        offload_state_dict=True,
         offload_folder=offload_dir,
-        no_split_module_classes=[
+        offload_state_dict=True,
+        trust_remote_code=True,
+        _fast_init=False,                     # fully defer weight init
+        no_split_module_classes=[             # never split a transformer block
             "LlamaDecoderLayer", "OPTDecoderLayer", "GPTNeoXLayer",
-            "MistralDecoderLayer", "BloomBlock"
+            "MistralDecoderLayer", "BloomBlock",
+            "LlamaMoEBlock", "MixtralDecoderLayer",
         ],
     )
-
     model.eval()
+
     return model, start, end
 
 ###############################################################################
@@ -233,8 +242,9 @@ class PipelineEngine:
         # References for convenience
         self.layers = self.model.model.layers
         self.embed  = self.model.model.embed_tokens if rank == 0 else None
-        self.head   = self.model.lm_head if rank == world - 1 else None
-        self.rotary = self.model.model.rotary_emb  # small, lives everywhere
+        self.head   = self.model.lm_head           if rank == world - 1 else None
+        # rotary embedding helper (models that do not expose it just ignore)
+        self.rotary = getattr(self.model.model, "rotary_emb", None)
 
         # Buffers for double‑buffer micro‑batch scheduling
         self.toggle = 0  # 0 or 1
@@ -303,17 +313,19 @@ class PipelineEngine:
 
                 # 2) Prepare input on rank 0
                 if self.rank == 0 and wave < num_mbs:
-                    start = wave * micro_bs
-                    end   = min(start + micro_bs, B)
-                    input_ids = batch["input_ids"][start:end].to(self.device,
-                                                                 non_blocking=True)
+                    start_idx = wave * micro_bs
+                    end_idx   = min(start_idx + micro_bs, B)
+                    input_ids = batch["input_ids"][start_idx:end_idx]\
+                                      .to(self.device, non_blocking=True)
                     hidden = self.embed(input_ids)  # [mb, T, D]
-                    seq_len = input_ids.size(1)
-                    pos_ids = torch.arange(seq_len, device=self.device)\
-                                    .unsqueeze(0).expand_as(input_ids)
-                    cos, sin = self.rotary(hidden, pos_ids)
-                    # embed returns hidden already; rotary will be re‑done
-                    # inside transformer layers (models that need it)
+
+                    if self.rotary is not None:
+                        seq_len = input_ids.size(1)
+                        pos_ids = torch.arange(seq_len,
+                                               device=self.device)\
+                                        .unsqueeze(0).expand_as(input_ids)
+                        self.rotary(hidden, pos_ids)  # in‑place
+
                 else:
                     # Wait for activations from previous stage
                     if recv_req is not None:
@@ -322,9 +334,7 @@ class PipelineEngine:
                 # 3) Run local transformer block(s)
                 if hidden is not None and self.start < self.end:
                     for layer_idx in range(self.start, self.end):
-                        layer = self.layers[layer_idx].to(self.device,
-                                                          non_blocking=True)
-                        # micro‑batch is small → single pass
+                        layer = self.layers[layer_idx]
                         hidden = layer(hidden)[0] if isinstance(
                             layer(hidden), tuple) else layer(hidden)
 
@@ -338,7 +348,8 @@ class PipelineEngine:
 
                 # 5) If last rank we have full hidden – make logits + sample
                 if self.rank == self.world - 1 \
-                        and wave >= self.world - 1 and wave < num_mbs + self.world - 1:
+                        and wave >= self.world - 1 \
+                        and wave < num_mbs + self.world - 1:
                     logits = self.head(hidden)[0]       # [mb, T, vocab]
                     probs  = torch.softmax(
                         logits / self.args.sampling_temperature, dim=-1)
@@ -418,7 +429,11 @@ def worker(args: Args):
     try:
         engine = PipelineEngine(args, rank, world, dbg)
 
-        tok = AutoTokenizer.from_pretrained(args.model_name)
+        tok = AutoTokenizer.from_pretrained(
+            args.model_name,
+            cache_dir=args.cache_dir,
+            token=args.hf_token,
+        )
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
 
